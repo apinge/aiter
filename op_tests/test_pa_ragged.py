@@ -942,16 +942,17 @@ if __name__ == "__main__":
             if quant_cache_dtype not in [None, dtypes.i8]:
                 continue
 
+        ctx_len = 256
         test_paged_attention(
             ctx_len,
-            128,
-            (8, 1),
+            1,
+            (32, 4),
             128,
             False,
-            16,
+            1,
             dtypes.bf16,
             "auto",
-            "HND",
+            "NHD",
             0.0,
             pa_variant,
             quant_cache_dtype,
