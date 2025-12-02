@@ -186,8 +186,8 @@ __device__ void s_waitcnt_lgkmcnt() {
 }
 
 #ifndef HQ
-#define HQ 32 
-#define HK 4
+#define HQ {{num_heads}} 
+#define HK {{num_kv_heads}}
 #define S 128 
 #define BLOCK_SIZE 1
 #define SCALE 0.08838834764831843f
@@ -250,7 +250,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
             __bf16* out_seg,        // [B, HQ, PART, S]
             float* qk_ptr,          // [B, HK, HQ // HK, PART * KV_PART_SIZE]
             float* max_out,         // [B, HQ, PART, 1]
-            float* sum_out) {       // [B, HQ, PART, 1]
+            float* sum_out,         // [B, HQ, PART, 1]
+            uint q_stride) {
     // wg: B, HK, kv_part
     uint b = blockIdx.x;
     uint hk = blockIdx.y;
@@ -258,7 +259,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     uint kv_part = blockIdx.z;
     uint lane_id = threadIdx.x % 64;
     uint warp_id = threadIdx.x / 64;
-    const uint q_b_stride = HQ * S;
+    const uint q_b_stride = q_stride;
     const uint q_h_stride = S;
     query += b * q_b_stride + hq * q_h_stride;
     key_cache += hk * S;
@@ -491,9 +492,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     __syncthreads();
     // each wave will process HQ / HK / 4 tokens of output, each
     float maxs[HQ / HK], sums[HQ / HK];
-    float real_max[HQ / HK / 4], real_sum[HQ / HK / 4];
-    for (uint i = 0; i < HQ / HK / 4; i++) {
-        uint m_token_id = HQ / HK / 4 * warp_id + i;
+    float real_max[(HQ / HK + 3) / 4], real_sum[(HQ / HK + 3) / 4];
+    for (uint i = 0; i < (HQ / HK + 3) / 4; i++) {
+        uint m_token_id = (HQ / HK + 3) / 4 * warp_id + i;
         maxs[4 * i + 0] = *share_buf.get_max_buf(m_token_id, 0);
         maxs[4 * i + 1] = *share_buf.get_max_buf(m_token_id, 1);
         maxs[4 * i + 2] = *share_buf.get_max_buf(m_token_id, 2);
@@ -529,8 +530,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 3) ^ fma_row_id] = vout_low[k * 4 + 3];
     }
     __syncthreads();
-    for (uint i = 0; i < HQ / HK / 4; i++) {
-        uint m_token_id = HQ / HK / 4 * warp_id + i;
+    for (uint i = 0; i < (HQ / HK + 3) / 4; i++) {
+        uint m_token_id = (HQ / HK + 3) / 4 * warp_id + i;
         if (m_token_id < HQ / HK) {
             bfloat16x2 tmp = ((bfloat16x2*)(share_buf.get_out_buf(0) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
             float32x2 out_v;
@@ -685,7 +686,8 @@ void {{func_name}}(void* out_ptr,
 
     if (std::is_same<__hip_bfloat16, {{dtype}}>::value) {
         static bool flag = false;
-        if ((p == nullptr || p[0] == '1') && head_size == 128 && num_heads == 32 && num_kv_heads == 4 && {{mtp}} == 1) {
+        if ((p == nullptr || p[0] == '1') && head_size == 128 && gqa_ratio <= 16 && {{mtp}} == 1 && kv_head_stride == head_size &&
+             kv_seq_stride == head_size * num_kv_heads && kv_block_stride == head_size * num_kv_heads) {
             if (flag == false)
                 printf ("==========================================hit pa========================= num_seqs=%d q_stride=%d kv_block_stride=%d kv_head_stride=%d kv_seq_stride=%d max_num_partitions=%d\n", num_seqs, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, max_num_partitions);
             flag = true;
@@ -709,7 +711,8 @@ void {{func_name}}(void* out_ptr,
                 reinterpret_cast<__bf16*>(tmp_out_ptr),
                 0,
                 max_logits_ptr,
-                exp_sums_ptr
+                exp_sums_ptr,
+                (uint)q_stride
             );
             dim3 reduce_grid(num_seqs, num_heads);
             dim3 reduce_block(NTHR);
