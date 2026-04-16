@@ -537,16 +537,19 @@ DUMP_INPUTS = False  # whether to dump inputs
 DUMP_OUTPUT = False  # whether to dump output
 
 
+# Only parametrizations that satisfy pa_ragged USE_PA fast path (pa_ragged.cpp.jinja):
+# bf16, head_size 128, gqa_ratio<=16, mtp 1, NHD, no alibi, no logits_soft_cap,
+# and block_size==1 so kv_block_stride == head_size * num_kv_heads.
 @pytest.mark.parametrize("ctx_lens", [128])
 @pytest.mark.parametrize("num_seqs", [1,])
 @pytest.mark.parametrize("num_heads", [(8, 1), (4, 2), (32, 4)])
 @pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("use_alibi", [False, True])
-@pytest.mark.parametrize("block_size", [1, 16, 32])
+@pytest.mark.parametrize("use_alibi", [False])
+@pytest.mark.parametrize("block_size", [1])
 @pytest.mark.parametrize("dtype", [dtypes.bf16])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto"])
 @pytest.mark.parametrize("kv_cache_layout", ["NHD"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
 @pytest.mark.parametrize("pa_variant", [PAVariant.Shomy])
 @pytest.mark.parametrize("quant_cache_dtype", [None])
 @pytest.mark.parametrize("seed", [0])
