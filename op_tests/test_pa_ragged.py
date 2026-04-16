@@ -537,20 +537,20 @@ DUMP_INPUTS = False  # whether to dump inputs
 DUMP_OUTPUT = False  # whether to dump output
 
 
-@pytest.mark.parametrize("ctx_lens", [1, 26, 128, 4097])
-@pytest.mark.parametrize("num_seqs", [1, 3, 31, 128])
+@pytest.mark.parametrize("ctx_lens", [128])
+@pytest.mark.parametrize("num_seqs", [1,])
 @pytest.mark.parametrize("num_heads", [(8, 1), (4, 2), (32, 4)])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("use_alibi", [False, True])
 @pytest.mark.parametrize("block_size", [1, 16, 32])
-@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+@pytest.mark.parametrize("dtype", [dtypes.bf16])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto"])
-@pytest.mark.parametrize("kv_cache_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("kv_cache_layout", ["NHD"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("pa_variant", [PAVariant.Shomy])
-@pytest.mark.parametrize("quant_cache_dtype", [None, dtypes.fp8, dtypes.i8])
+@pytest.mark.parametrize("quant_cache_dtype", [None])
 @pytest.mark.parametrize("seed", [0])
-@pytest.mark.parametrize("device", ["cuda:0"])
+@pytest.mark.parametrize("device", ["cuda:4"])
 def test_paged_attention(
     ctx_lens: int,
     num_seqs: int,

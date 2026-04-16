@@ -310,21 +310,22 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     auto cur_kv_len_start = kv_len_start + 0 * KV_MIN_PART_SIZE;
 
     uint* idx_lds = share_buf.get_idx_buf(warp_id);
-    llvm_amdgcn_raw_buffer_load_lds(idx_buf.descriptor, (as3_uint32_ptr)idx_lds, 4, (lane_id + cur_kv_len_start) * sizeof(uint), 0, 0, 0);
-    __builtin_amdgcn_sched_barrier(0);
+    uint idx_global = lane_id + cur_kv_len_start;
+    idx_lds[lane_id] = (idx_global < kv_len_end) ? kv_page_indices[idx_global] : 0;
+    __syncthreads();
 
     #pragma unroll
     for (uint part_idx = 0; part_idx < KV_PART_SIZE / KV_MIN_PART_SIZE; part_idx++) {
         if (part_idx == 0)
         if (BLOCK_SIZE == 1) {
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-    #if FAKE_K_IDX
                 uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
+    #if FAKE_K_IDX
                 global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
                 k_idxs[n] = global_row_id + 1 + kv_indptr[b];
     #else
                 //k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
-                k_idxs[n] = idx_lds[n * 4 + key_load_row_id];
+                k_idxs[n] = (global_row_id < kv_len_end) ? idx_lds[n * 4 + key_load_row_id] : 0;
     #endif
             }
         }
@@ -380,12 +381,14 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         if (BLOCK_SIZE == 1) {
             // llvm_amdgcn_raw_buffer_load_lds(idx_buf.descriptor, (as3_uint32_ptr)idx_lds, 4, (lane_id + kv_len_start) * sizeof(uint), (part_idx + 1) * KV_MIN_PART_SIZE * sizeof(uint), 0, 0);
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-    #if FAKE_K_IDX
                 uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
+    #if FAKE_K_IDX
                 global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
                 k_idxs[n] = global_row_id + 1;
     #else
-                k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
+                k_idxs[n] = (global_row_id < kv_len_end)
+                                ? buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint))
+                                : 0;
                 // k_idxs[n] = idx_lds[n * 4 + key_load_row_id];
     #endif
             }
@@ -686,9 +689,15 @@ void {{func_name}}(void* out_ptr,
 
     if (std::is_same<__hip_bfloat16, {{dtype}}>::value) {
         static bool flag = false;
-        if ((p == nullptr || p[0] == '1') && head_size == 128 && gqa_ratio <= 16 && {{mtp}} == 1 && kv_head_stride == head_size &&
+        if ((p == nullptr || p[0] == '1') &&
+             !{{"true" if alibi_enabled else "false"}} &&
+             !LOGITS_SOFT_CAP_ENABLED &&
+             head_size == 128 &&
+             gqa_ratio <= 16 &&
+             {{mtp}} == 1 &&
+             kv_head_stride == head_size &&
              kv_seq_stride == head_size * num_kv_heads && kv_block_stride == head_size * num_kv_heads) {
-            if (flag == false)
+          //  if (flag == false) 测试 是否hit中 保留不要动！
                 printf ("==========================================hit pa========================= num_seqs=%d q_stride=%d kv_block_stride=%d kv_head_stride=%d kv_seq_stride=%d max_num_partitions=%d\n", num_seqs, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, max_num_partitions);
             flag = true;
             int cur_max_num_partitions = max_num_partitions;
