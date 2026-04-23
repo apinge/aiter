@@ -23,6 +23,8 @@ def compile(
     mtp: int = 1,
     logits_soft_cap_enabled: bool = False,
     func_name: str = None,
+    num_heads: int = 0,
+    num_kv_heads: int = 0
 ):
     import os
 
@@ -59,6 +61,8 @@ def compile(
         func_name=func_name,
         # choice: [GOLDEN, EXPERIMENTAL]. Classify original kernel and experimental kernel
         version=version,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
     )
 
 
@@ -131,6 +135,38 @@ def paged_attention_ragged(
     )
     gqa_ratio = int(num_heads / num_kv_heads)
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    # Match the C++ AITER_DEBUG_PA_HIT logic in the jinja template so the Python path can be checked before rebuild.
+    # import os
+
+    # if os.environ.get("AITER_DEBUG_PA_HIT", "") == "1":
+    #     _exp = int(head_size * num_kv_heads)
+    #     _q = int(q_stride)
+    #     _kb = int(kv_block_stride)
+    #     _kh = int(kv_head_stride)
+    #     _ks = int(kv_seq_stride)
+    #     _bf16 = dtype == "__hip_bfloat16"
+    #     u = os.environ.get("USE_PA")
+    #     if u is None:
+    #         _use = True
+    #     else:
+    #         _use = len(u) > 0 and u[0] == "1"
+    #     _hit = (
+    #         _bf16
+    #         and _use
+    #         and int(head_size) == 256
+    #         and gqa_ratio <= 16
+    #         and int(mtp) == 1
+    #         and _kh == int(head_size)
+    #         and _ks == _exp
+    #         and _kb == _exp
+    #     )
+    #     print(
+    #         f"[pa_ragged][py]  hit={int(_hit)} | bf16={int(_bf16)} use_pa_env={int(_use)} "
+    #         f"h256={int(int(head_size) == 256)} gqa<=16({gqa_ratio}) mtp={int(mtp)} | "
+    #         f"kv_h={_kh} need_h={int(head_size)} | kv_s={_ks} need_s={_exp} | "
+    #         f"kv_b={_kb} need_b={_exp} | q_stride={_q} | layout={kv_cache_layout!r} | USE_PA={u!r}",
+    #         flush=True,
+    #     )
     func = compile(
         gqa_ratio,
         head_size,
@@ -144,6 +180,8 @@ def paged_attention_ragged(
         partition_size,
         mtp,
         bool(logits_soft_cap),
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
     )
 
     alibi_slopes_ptr = (
