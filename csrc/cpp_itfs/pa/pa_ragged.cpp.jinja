@@ -190,7 +190,8 @@ __device__ void s_waitcnt_lgkmcnt() {
 #define HK {{num_kv_heads}}
 #define S 256 
 #define BLOCK_SIZE 1
-#define SCALE 0.08838834764831843f
+/* Q*K attention scale: 1/sqrt(head_dim), same as the main ck_tile path and pa-256. A wrong constant (e.g. 1/sqrt(128) for head_dim 256) scales logits by ~sqrt(2) and breaks numerical match with reference. */
+#define SCALE (1.f / sqrtf((float){{ head_size }}))
 #define KV_PART_SIZE {{partition_size}}
 #endif
 #define KV_MIN_PART_SIZE 256
@@ -750,7 +751,7 @@ void {{func_name}}(void* out_ptr,
         if ((p == nullptr || p[0] == '1') && head_size == 256 && gqa_ratio <= 16 && {{mtp}} == 1 && kv_head_stride == head_size &&
              kv_seq_stride == head_size * num_kv_heads && kv_block_stride == head_size * num_kv_heads) {
             //if (print_flag == true)
-               // printf ("==========================================hit pa========================= num_seqs=%d q_stride=%d kv_block_stride=%d kv_head_stride=%d kv_seq_stride=%d max_num_partitions=%d\n", num_seqs, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, max_num_partitions);
+                printf ("==========================================hit pa========================= num_seqs=%d q_stride=%d kv_block_stride=%d kv_head_stride=%d kv_seq_stride=%d max_num_partitions=%d PARTITION_SIZE=%d\n", num_seqs, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, max_num_partitions, PARTITION_SIZE);
             // print_flag = true;
             int cur_max_num_partitions = max_num_partitions;
             float* exp_sums_ptr   = reinterpret_cast<float*>(workspace_buffer);
