@@ -48,6 +48,36 @@ def get_recommended_splits(num_sequences, num_kv_heads):
     )
     return max_context_partition_num
 
+# def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
+#     props = torch.cuda.get_device_properties()
+#     num_sm = props.multi_processor_count * get_occupancy()
+#     max_context_partition_num = triton.cdiv(
+#         num_sm, num_sequences * num_kv_heads * split_kv_blocks
+#     )
+#     max_context_partition_num *= split_kv_blocks
+#     return min(max_context_partition_num, 8)
+
+
+def _jit_next_pow2(n: int) -> int:
+    """Smallest power of 2 >= n. Host-side only (wrappers); not allowed inside @jit bodies."""
+    n = int(n)
+    if n <= 1:
+        return 1
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def _gluon_query_group_pow2(query_seq_len: int, query_group_size: int) -> tuple[int, int]:
+    """Match layout constexpr logic inside Gluon PA kernels; computed only on host."""
+    qsp2 = _jit_next_pow2(query_seq_len)
+    if query_group_size <= 16 // qsp2:
+        ogsp2 = 16 // qsp2
+    else:
+        ogsp2 = _jit_next_pow2(query_group_size)
+    return qsp2, ogsp2
+
 
 # Pre-compute version check as constexpr for use in JIT kernels
 TRITON_VERSION_GE_3_6_0 = tl.constexpr(tv.TRITON_VERSION_GE_3_6_0)
@@ -99,6 +129,8 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     COMPUTE_TYPE: gl.constexpr,
     QUERY_SEQ_LEN: gl.constexpr,
     ONE_QUERY_GROUP_SIZE: gl.constexpr,
+    QUERY_SEQ_LEN_POW2: gl.constexpr,
+    ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr,
     HEAD_SIZE_POW2: gl.constexpr,
     KV_BLOCK_SIZE: gl.constexpr,
     CONTEXT_PARTITION_SIZE: gl.constexpr,
@@ -184,14 +216,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         HEAD_SIZE_POW2 // CONTIGUOUS_KV_ELEMENTS_16B_LOAD
     )
 
-    # Calculate MTP (Multi-Token Prefill) layout parameters
-    QUERY_SEQ_LEN_POW2: gl.constexpr = triton.next_power_of_2(QUERY_SEQ_LEN)
-    if ONE_QUERY_GROUP_SIZE <= 16 // QUERY_SEQ_LEN_POW2:
-        ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr = 16 // QUERY_SEQ_LEN_POW2
-    else:
-        ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(
-            ONE_QUERY_GROUP_SIZE
-        )
     QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
 
     # ==================== Memory Layout Definitions ====================
@@ -1694,6 +1718,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     COMPUTE_TYPE: gl.constexpr,
     QUERY_SEQ_LEN: gl.constexpr,
     ONE_QUERY_GROUP_SIZE: gl.constexpr,
+    QUERY_SEQ_LEN_POW2: gl.constexpr,
+    ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr,
     HEAD_SIZE_POW2: gl.constexpr,
     KV_BLOCK_SIZE: gl.constexpr,
     CONTEXT_PARTITION_SIZE: gl.constexpr,
@@ -1781,14 +1807,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential conversion
 
-    # Calculate MTP (Multi-Token Prefill) layout parameters
-    QUERY_SEQ_LEN_POW2: gl.constexpr = triton.next_power_of_2(QUERY_SEQ_LEN)
-    if ONE_QUERY_GROUP_SIZE <= 16 // QUERY_SEQ_LEN_POW2:
-        ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr = 16 // QUERY_SEQ_LEN_POW2
-    else:
-        ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(
-            ONE_QUERY_GROUP_SIZE
-        )
     QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
 
     K_HEAD_SIZE_SPLITS: gl.constexpr = HEAD_SIZE_POW2 // KV_16B_ELEMENT_COUNT
@@ -2674,6 +2692,8 @@ def paged_attention_decode_v2_reduce_kernel(
     num_kv_heads,
     OUTPUT_SEQ_LEN: tl.constexpr,
     ONE_OUTPUT_GROUP_SIZE: tl.constexpr,
+    OUTPUT_SEQ_LEN_POW2: tl.constexpr,
+    ONE_OUTPUT_GROUP_SIZE_POW2: tl.constexpr,
     HEAD_SIZE_POW2: tl.constexpr,
     CONTEXT_PARTITION_SIZE: tl.constexpr,
     USE_SINKS: tl.constexpr,
@@ -2701,15 +2721,7 @@ def paged_attention_decode_v2_reduce_kernel(
     """
     MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
 
-    # Calculate output layout parameters
-    OUTPUT_SEQ_LEN_POW2: tl.constexpr = triton.next_power_of_2(OUTPUT_SEQ_LEN)
-    if ONE_OUTPUT_GROUP_SIZE <= 16 // OUTPUT_SEQ_LEN_POW2:
-        ONE_OUTPUT_GROUP_SIZE_POW2: gl.constexpr = 16 // OUTPUT_SEQ_LEN_POW2
-    else:
-        ONE_OUTPUT_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(
-            ONE_OUTPUT_GROUP_SIZE
-        )
-    QUERY_GROUP_SIZE_POW2: gl.constexpr = (
+    QUERY_GROUP_SIZE_POW2: tl.constexpr = (
         OUTPUT_SEQ_LEN_POW2 * ONE_OUTPUT_GROUP_SIZE_POW2
     )
 
@@ -2966,12 +2978,10 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         parameters for Triton compilation and execution.
     """
     num_sequences, num_kv_heads, num_splits = grid
-    HEAD_SIZE_POW2 = triton.next_power_of_2(HEAD_SIZE)
-    QUERY_SEQ_LEN_POW2 = triton.next_power_of_2(query_seq_len)
-    if query_group_size <= 16 // QUERY_SEQ_LEN_POW2:
-        ONE_QUERY_GROUP_SIZE_POW2 = 16 // QUERY_SEQ_LEN_POW2
-    else:
-        ONE_QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
+    HEAD_SIZE_POW2 = _jit_next_pow2(HEAD_SIZE)
+    QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2 = _gluon_query_group_pow2(
+        query_seq_len, query_group_size
+    )
     waves_per_eu = 1
     KV_COMPUTE_BLOCK_SIZE = CONTEXT_PARTITION_SIZE
     # Select kernel implementation based on block size
@@ -3102,6 +3112,8 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         COMPUTE_TYPE=COMPUTE_TYPE,
         QUERY_SEQ_LEN=query_seq_len,
         ONE_QUERY_GROUP_SIZE=query_group_size,
+        QUERY_SEQ_LEN_POW2=QUERY_SEQ_LEN_POW2,
+        ONE_QUERY_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
         HEAD_SIZE_POW2=HEAD_SIZE_POW2,
         KV_BLOCK_SIZE=KV_BLOCK_SIZE,
         CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
@@ -3152,8 +3164,9 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     Args:
         All parameters from the reduction kernel plus execution grid configuration
     """
-    QUERY_SEQ_LEN_POW2 = triton.next_power_of_2(query_seq_len)
-    ONE_QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
+    QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2 = _gluon_query_group_pow2(
+        query_seq_len, query_group_size
+    )
     if PS:
         paged_attention_decode_ps_reduce_kernel[grid](
             output_ptr,
@@ -3178,10 +3191,10 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             context_partition_num=context_partition_num,
             QUERY_SEQ_LEN_POW2=QUERY_SEQ_LEN_POW2,
             ONE_QUERY_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
-            HEAD_SIZE_POW2=triton.next_power_of_2(HEAD_SIZE),
+            HEAD_SIZE_POW2=_jit_next_pow2(HEAD_SIZE),
             USE_SINKS=sink_token_ptr is not None,
             MAX_CONTEXT_PARTITION_NUM=min(
-                triton.next_power_of_2(context_partition_num), 16
+                _jit_next_pow2(context_partition_num), 16
             ),
         )
     else:
@@ -3208,7 +3221,9 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             num_kv_heads=grid[1],
             OUTPUT_SEQ_LEN=query_seq_len,
             ONE_OUTPUT_GROUP_SIZE=query_group_size,
-            HEAD_SIZE_POW2=triton.next_power_of_2(HEAD_SIZE),
+            OUTPUT_SEQ_LEN_POW2=QUERY_SEQ_LEN_POW2,
+            ONE_OUTPUT_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
+            HEAD_SIZE_POW2=_jit_next_pow2(HEAD_SIZE),
             CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
             USE_SINKS=sink_token_ptr is not None,
         )
