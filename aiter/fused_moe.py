@@ -19,6 +19,11 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
+import pyhip
+from pyhip.contrib.moe import moe_2stage_gateup, moe_2stage_down
+from pyhip.contrib.moe_gemm_8wave import moe_gemm_final_reduce_bf16
+
+
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
@@ -175,6 +180,88 @@ def fused_moe(
 
         if moe_buf is not None:
             return moe_buf
+
+    # Fast path for small batches for Qwen3.5 397B FP8 PTP （prefill）
+    if(os.environ.get('AITER_MOE_PREFILL_BATCH', '0') == '1' and hidden_states.shape[0] >=512 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)):
+        fp8_quant_type = QuantType.per_Token
+        fp8_ptpc = (fp8_quant_type == aiter.QuantType.per_Token)
+        # HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK = 4096, 128, 512, 10
+        #print("===========================================================================")
+        #quant_type_str = quant2str_dict.get(fp8_quant_type, 'no')
+        B = hidden_states.shape[0]
+        E, N1, K1 = w1.shape
+        N2, K2 = w2.shape[1], w2.shape[2]
+        TOPK = topk_ids.shape[1]
+        gemm1_out = torch.empty([B, TOPK, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
+
+        TILE_M, TILE_N = 64, 128
+        BLOCK_TILE_SIZE_M = TILE_M
+        BLOCK_TILE_SIZE_N = TILE_N
+
+
+        #assert weight_type == torch.bfloat16, f'mxn_2s only support bfloat16, but got {weight_type}'
+        # test moe_gemm_batch_vmn: 2 stages, m/n can be set
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+            topk_ids,
+            topk_weight,
+            E,
+            N2,     # reduce dim is same with output dim
+            hidden_states.dtype,
+            TILE_M,
+            None,
+            None,
+            0,
+        )
+
+        # always quantize activation with aiter.QuantType.per_Token
+        # fp8_quant_type is only for weights
+        weight_type = torch.float8_e4m3fnuz
+        quant_func = aiter.get_hip_quant(aiter.QuantType.per_Token)
+        hidden_states_q, hidden_states_scale = quant_func(
+            hidden_states,
+            scale=None,
+            quant_dtype=weight_type,
+            num_rows=None,
+        )
+        
+        moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0]], [256],
+            w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,  str(fp8_quant_type),
+            hidden_states_q, w1, 
+            gemm1_out, 
+            sorted_ids, 
+            sorted_expert_ids, 
+            num_valid_ids, 
+            hidden_states_scale,
+            w1_scale, B, N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0])
+        gemm1_out_q, gemm1_out_scale = quant_func(
+            gemm1_out.view(B * TOPK, -1),
+            scale=None,
+            quant_dtype=w2.dtype,
+            num_rows=None,
+            )
+        gemm2_out = torch.empty(B, TOPK, N2, dtype=torch.bfloat16, device=gemm1_out_q.device)
+        #down_mem_size = HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size + B * TOPK * INTER_SIZE_TP * 2 + B * TOPK * HIDDEN_SIZE * 2
+
+        moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
+            w2.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, str(fp8_quant_type),
+            gemm1_out_q, w2, 
+            gemm2_out, #cur_out,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            gemm1_out_scale,
+            w2_scale,
+            B,
+            sorted_expert_ids.shape[0])
+        num_WG = 80 * 4 # MI308 only 80 CU
+        num_tokens_wg = B // num_WG
+        num_extra_tokens = B % num_WG
+        moe_gemm_final_reduce_bf16([num_WG], [64], TOPK, N2,
+                    gemm2_out.data_ptr(),
+                    cur_out.data_ptr(),
+                    num_tokens_wg, num_extra_tokens, B)
+        return cur_out
 
     if not block_size_M:
         block_size_M = -1
