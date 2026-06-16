@@ -790,7 +790,7 @@ _PADDED_M_TIERS = [32768, 131072]
 
 def get_padded_M(M):
     if M < _PADDED_M_TIERS[0]:
-        return nextPow2(M)
+        return max(nextPow2(M), 2)
     for tier in reversed(_PADDED_M_TIERS):
         if M >= tier:
             return tier
