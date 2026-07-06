@@ -1157,11 +1157,18 @@ class FmoeTuner(TunerCommon):
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
             w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
-        elif q_dtype_w == dtypes.fp8 and q_dtype_a == dtypes.fp8:  # mxfp8 (a8w8)
-            w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
-            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
-            w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
+        elif q_dtype_w == dtypes.fp8 and q_dtype_a == dtypes.fp8:
+            # per_128x128 blockscale: weight shuffle done in generate_data();
+            # CK only needs e8m0_shuffle on scales (test_moe_2stage.py).
+            w1_qt_shffle_ck = w1_qt_shffle
+            w2_qt_shffle_ck = w2_qt_shffle
+            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
             w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+            # elif q_dtype_w == dtypes.fp8 and q_dtype_a == dtypes.fp8:  # mxfp8 (a8w8)
+            #     w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
+            #     w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
+            #     w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
+            #     w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
