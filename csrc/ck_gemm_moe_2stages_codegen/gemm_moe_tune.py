@@ -2542,6 +2542,82 @@ class FmoeTuner(TunerCommon):
                         )
                     )
 
+                for sk in splitk_list:
+                    for kernel in ck_stage1_splitk_kernels.values():
+                        if kernel.MPerBlock != blockM:
+                            continue
+                        tag_name = f"{kernel.name}_sk{sk}"
+                        tasks_ck.append(
+                            (
+                                (info, "stage1", tag_name, blockM),
+                                FmoeTuner.generate_data_2stages,
+                                (
+                                    token,
+                                    model_dim,
+                                    inter_dim,
+                                    expert,
+                                    topk,
+                                    act_type,
+                                    dtype,
+                                    q_dtype_a,
+                                    q_dtype_w,
+                                    q_type,
+                                    use_g1u1,
+                                    doweight_stage1,
+                                    blockM,
+                                    1,
+                                ),
+                                FmoeTuner.ck_moe_stage1_fwd_out,
+                                (
+                                    [
+                                        "a1_qt",
+                                        "w1_qt_shffle_ck",
+                                        "w2_qt_shffle_ck",
+                                        "sorted_ids",
+                                        "sorted_expert_ids",
+                                        "sorted_weights",
+                                        "num_valid_ids",
+                                        "w1_scale_aiter",
+                                        "a1_scale_fp4_sort",
+                                    ],
+                                    dtype,
+                                    topk,
+                                    kernel.name,
+                                    blockM,
+                                    q_type,
+                                    act_type,
+                                    sk,
+                                ),
+                                {},
+                                FmoeTuner.run_torch_moe_stage1,
+                                (
+                                    [
+                                        "a1_qt",
+                                        "w1_qt",
+                                        "w2_qt",
+                                        "topk_weights",
+                                        "topk_ids",
+                                        "a1_scale",
+                                        "w1_scale",
+                                        "sorted_ids",
+                                        "num_valid_ids",
+                                        "bias",
+                                    ],
+                                    dtype,
+                                    act_type,
+                                    q_type,
+                                    doweight_stage1,
+                                    topk,
+                                    blockM,
+                                ),
+                                {},
+                                (None),
+                                0.01,
+                                0.01,
+                                None,
+                            )
+                        )
+
                 for kernel in ck_stage2_kernels.values():
                     if kernel.MPerBlock != blockM:
                         continue
