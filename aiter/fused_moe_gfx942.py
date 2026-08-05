@@ -63,10 +63,8 @@ def get_tune_space():
     return [
         # decoding ignored BLOCK_N/BLOCK_K
         Config(16, 16, 16, False).to_string(),
-        # Config(64, 256, 64, True).to_string(),
-        # Config(64, 256, 128, True).to_string(),
-        Config(64, 128, 256, True).to_string(),
         Config(64, 128, 128, True).to_string(),
+        Config(64, 256, 128, True).to_string(),
     ]
 
 
@@ -212,7 +210,7 @@ def fused_moe_gfx942(
         # default to ptpc act for both per_Token/per_Tensor weights.
         act_quant_type_str = "ptpc"
 
-        DOWN_BLOCK_TILE_SIZE_N = 128
+        DOWN_BLOCK_TILE_SIZE_N = kcfgs.BLOCK_N
 
         # prefill_1x4 gateup input: native-fp8 needs a quantized activation plus its per-token
         # scale; bf16 passes the activation through with a dummy scale (unused by bf16 path).
