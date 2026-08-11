@@ -715,6 +715,7 @@ def fused_moe_(
             expert_mask,
             num_local_tokens,
             moe_sorting_dispatch_policy,
+            swiglu_limit=swiglu_limit,
         )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
