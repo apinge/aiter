@@ -454,6 +454,103 @@ def test_flydsl_gdr_decode(args):
         assert is_allclose
 
 
+@pytest.mark.parametrize("batch_size", [1, 8, 16, 24, 128])
+def test_flydsl_gdr_decode_qwen38_tp8_shape_matrix(batch_size):
+    """Qwen3.8 PP2/TP8 local decode shape: K=2, V=16, Dk=Dv=128."""
+    args = Args(
+        dtype=torch.bfloat16,
+        b=batch_size,
+        sq=1,
+        num_k_heads=2,
+        num_v_heads=16,
+        head_k_dim=128,
+        head_v_dim=128,
+        use_qk_l2norm=True,
+    )
+    inputs = create_inputs(args)
+    out = create_outputs(args)[0]
+    out_ref = create_outputs(args)[0]
+    actual = list(inputs + (out,))
+    reference = list(inputs + (out_ref,))
+    actual[-2] = actual[-2].clone()
+    reference[-2] = reference[-2].clone()
+
+    func(*actual)
+    ref_func(*reference)
+
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(
+        actual[-2],
+        reference[-2],
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
+def test_flydsl_gdr_decode_qwen38_tp8_multistep_state():
+    """Keep the Qwen3.8 state in VK layout across successive decode steps."""
+    args = Args(
+        dtype=torch.bfloat16,
+        b=8,
+        sq=1,
+        num_k_heads=2,
+        num_v_heads=16,
+        head_k_dim=128,
+        head_v_dim=128,
+        use_qk_l2norm=True,
+    )
+    pool_size = args.b + 2
+    state_vk = torch.randn(
+        (pool_size, args.num_v_heads, args.head_v_dim, args.head_k_dim),
+        dtype=torch.float32,
+    )
+    state_kv_ref = state_vk.transpose(-1, -2).contiguous()
+    indices = torch.tensor([8, 0, 4, 7, 2, 9, 1, 5], dtype=torch.int32)
+
+    for seed in range(4):
+        torch.manual_seed(20260825 + seed)
+        _, query, key, value, a, b, dt_bias, A_log, _, _ = create_inputs(args)
+        out = create_outputs(args)[0]
+        out_ref = create_outputs(args)[0]
+
+        flydsl_gdr_decode(
+            query,
+            key,
+            value,
+            a,
+            b,
+            dt_bias,
+            A_log,
+            indices,
+            state_vk,
+            out,
+            use_qk_l2norm=True,
+            need_shuffle_state=False,
+        )
+        run_triton_kernel(
+            out_ref,
+            A_log,
+            dt_bias,
+            query,
+            key,
+            value,
+            a,
+            b,
+            state_kv_ref,
+            indices,
+            128**-0.5,
+            True,
+        )
+
+        torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(
+            state_vk,
+            state_kv_ref.transpose(-1, -2),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+
 def test_flydsl_gdr_decode_supports_strided_ab():
     args = Args(
         dtype=torch.bfloat16,
@@ -563,7 +660,7 @@ def test_flydsl_gdr_decode_pr3135_target_shape_matrix(
     )
 
 
-@pytest.mark.parametrize("num_k_heads,num_v_heads", [(16, 48), (2, 8)])
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(16, 48), (2, 8), (2, 16)])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 24, 32, 64])
 def test_flydsl_gdr_decode_pr3135_graph_replay_changed_indices(
     num_k_heads,
