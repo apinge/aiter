@@ -496,6 +496,17 @@ def get_gemm2_kernels_list(
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = {k: copy.deepcopy(v) for k, v in gemm2_kernels_dict[tag].items()}
+    if (
+        tag == "a8w8"
+        and Adtype.upper() == "F8"
+        and Bdtype.upper() == "F8"
+        and QuantType == 2
+    ):
+        # The plain A8W8 path always consumes preshuffled weights. These
+        # two-wave K=64 instances retain KPack=16 for FP8 PTPC, including
+        # intermediate sizes that cannot use a KPerBlock=128 instance.
+        for index, block_m in enumerate((32, 64, 128, 256), start=20):
+            kernels_list[index] = kernelInstanceGEMM2(128, block_m, 64, 64, 2, 1, 1)
     for kernel in kernels_list.values():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.Nswizzle = Nswizzle

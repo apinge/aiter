@@ -529,13 +529,39 @@ A8W8_gemm2_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
+        // Plain A8W8 kernels always consume preshuffled B, even when the
+        // caller lost the optional Tensor.is_shuffled attribute. FP8 PTPC
+        // shuffle_weight packs 16 K elements; BLOCKSIZE=256/KPerBlock=64
+        // instances use KPack=8 and cannot consume that layout.
+        constexpr bool fp8_ptpc_preshuffle =
+            ck::is_same_v<{A0DataType}, F8> && ck::is_same_v<{B0DataType}, F8>
+            && {Quant} == static_cast<int>(QuantType::per_Token);
+        if constexpr(fp8_ptpc_preshuffle)
+        {{
+            // K=64/192 cannot use a 128-wide K tile. Two-wave instances keep
+            // KPerBlock=64 with AK1/BK1=16, preserving the preshuffle layout.
+            if (inter_dim <= 192 && inter_dim % 128 != 0)
+            {{
+                switch (block_m)
+                {{
+                case 32:
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 32, 64, 64, 2, 1, {Nswizzle}, false, {MulRoutedWeight}, {ActOP}>;
+                case 64:
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 64, 64, 64, 2, 1, {Nswizzle}, false, {MulRoutedWeight}, {ActOP}>;
+                case 128:
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 128, 64, 64, 2, 1, {Nswizzle}, false, {MulRoutedWeight}, {ActOP}>;
+                case 256:
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 256, 64, 64, 2, 1, {Nswizzle}, false, {MulRoutedWeight}, {ActOP}>;
+                }}
+            }}
+        }}
         if (block_m == 16)
         {{
             return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 64, 64, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
         else if (block_m == 32)
         {{
-            if (inter_dim <= 192)
+            if (inter_dim <= 192 && !fp8_ptpc_preshuffle)
             {{
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
@@ -546,7 +572,7 @@ A8W8_gemm2_heuristic_dispatch = """
         }}
         else if (block_m == 64)
         {{
-            if (inter_dim <= 192)
+            if (inter_dim <= 192 && !fp8_ptpc_preshuffle)
             {{
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
@@ -557,7 +583,7 @@ A8W8_gemm2_heuristic_dispatch = """
         }}
         else if (block_m == 128)
         {{
-            if (inter_dim <= 192)
+            if (inter_dim <= 192 && !fp8_ptpc_preshuffle)
             {{
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
@@ -568,7 +594,7 @@ A8W8_gemm2_heuristic_dispatch = """
         }}
         else if (block_m == 256)
         {{
-            if (inter_dim <= 192)
+            if (inter_dim <= 192 && !fp8_ptpc_preshuffle)
             {{
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
