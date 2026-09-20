@@ -31,7 +31,7 @@ FP8_DTYPE = torch.float8_e4m3fnuz
 DIFF_THR = 0.002
 CONFIG_CSV = (
     Path(__file__).resolve().parents[1]
-    / "aiter/configs/model_configs/qwen3_5_125b_fp8_ptpc_tuned_fmoe.csv"
+    / "aiter/configs/model_configs/qwen3_8_flash_next_fp8_ptpc_tuned_fmoe.csv"
 )
 
 TP_CONFIGS = {

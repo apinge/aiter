@@ -14,7 +14,7 @@ from typing import Any
 
 CONFIG_CSV = (
     Path(__file__).resolve().parents[1]
-    / "aiter/configs/model_configs/qwen3_5_125b_bf16_tuned_fmoe.csv"
+    / "aiter/configs/model_configs/qwen3_8_flash_next_bf16_tuned_fmoe.csv"
 )
 
 # Bind fused_moe's process-lifetime config cache before importing aiter.

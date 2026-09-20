@@ -346,7 +346,7 @@ class TestFlydslGfx942MoeConfig(unittest.TestCase):
 
         csv_path = os.path.join(
             AITER_ROOT,
-            "aiter/configs/model_configs/qwen3_5_125b_fp8_ptpc_tuned_fmoe.csv",
+            "aiter/configs/model_configs/qwen3_8_flash_next_fp8_ptpc_tuned_fmoe.csv",
         )
         jobs = parse_csv(csv_path)
         whole_graph_jobs = [job for job in jobs if job["stage"] == "whole_graph"]
