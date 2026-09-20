@@ -35,9 +35,9 @@ CONFIG_CSV = (
 )
 
 TP_CONFIGS = {
-    640: "qwen3_5_125b_tp1",
-    320: "qwen3_5_125b_tp2",
-    192: "qwen3_5_125b_tp4",
+    640: "qwen3_8_flash_next_tp1",
+    320: "qwen3_8_flash_next_tp2",
+    192: "qwen3_8_flash_next_tp4",
 }
 
 
