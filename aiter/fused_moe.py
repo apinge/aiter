@@ -27,6 +27,7 @@ from aiter.fused_moe_registry import (
     BoundFusedMoeImpl,
     FusedMoeImplResolutionError,
     FusedMoeRequest,
+    register_fused_moe_impl,
     resolve_fused_moe_impl,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
@@ -59,6 +60,10 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_g2_kname_any,
 )
 from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
+
+register_fused_moe_impl(
+    "asmjit_gfx942", "aiter.fused_moe_asmjit_aot:run_asmjit_moe_gfx942_impl"
+)
 
 BLOCK_SIZE_M = 32
 
@@ -2374,13 +2379,13 @@ def get_2stage_cfgs(
         full_impl = None
     if (
         full_impl is not None
-        and kernel_name1.startswith("impl__flydsl_")
+        and kernel_name1.startswith(("impl__flydsl_", "impl__asmjit_"))
         and not weights_shuffled
     ):
         cfg = None
         full_impl = None
         logger.warning(
-            f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
+            f"[fused_moe] discarding {kernel_name1!r} whole-graph config for {keys}: "
             "both w1 and w2 must be marked is_shuffled=True; using default "
             "heuristics"
         )
