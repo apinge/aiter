@@ -134,14 +134,6 @@ def _store_fp32_tile(s_t, row_base, col_base, d_f32x4, thr_copy, copy_atom):
     fx.copy(copy_atom, frag, part_dst)
 
 
-def _identity_frag(lane):
-    """Return the identity fragment for one diagonal block."""
-    n = lane % 16
-    mb4 = (lane // 16) * 4
-    elems = [((mb4 + p) == n).select(1.0, 0.0) for p in range(4)]
-    return fx.Float32x4(elems)
-
-
 def _wy_prefetch(src, copy_atom, thr_copy):
     part_src = thr_copy.partition_S(src)
     regs = fx.make_fragment_like(part_src)
@@ -179,6 +171,36 @@ def _wave_inclusive_scan(val, tid, width, zero):
         csum = csum + (tid >= s).select(prev, zero)
         s <<= 1
     return csum
+
+
+def _load_full_fp32_tile(s_t, row_base, col_base, thr_copy, copy_atom, transpose=False):
+    """Keep inverse blocks in FP32 until the merge operands are split."""
+    src = _tile16_view(s_t, row_base, col_base, transpose)
+    part_src = thr_copy.partition_S(src)
+    frag = fx.make_fragment_like(part_src)
+    fx.copy(copy_atom, part_src, frag)
+    return fx.Float32x4(frag.load())
+
+
+def _mfma16_bf16x2(a, b, c):
+    """Merge inverse blocks using two BF16 components per FP32 operand.
+
+    Casting each inverse block straight to BF16 loses the small residuals in
+    products of strongly correlated keys. Accumulate all four cross products
+    in FP32, retaining those residuals while using the fast BF16 MFMA.
+    """
+    a, b = fx.Float32x4(a), fx.Float32x4(b)
+    ah, bh = _accum_to_bf16x4(a), _accum_to_bf16x4(b)
+    al = fx.BFloat16x4(
+        [(a[p] - ah[p].to(fx.Float32)).to(fx.BFloat16) for p in range(4)]
+    )
+    bl = fx.BFloat16x4(
+        [(b[p] - bh[p].to(fx.Float32)).to(fx.BFloat16) for p in range(4)]
+    )
+    out = _mfma16(al, bl, c)
+    out = _mfma16(al, bh, out)
+    out = _mfma16(ah, bl, out)
+    return _mfma16(ah, bh, out)
 
 
 @functools.lru_cache(maxsize=64)
@@ -433,50 +455,35 @@ def compile_gdn_prepare(
                 beta_j = s_beta[tid]
                 gc[tid] = beta_j * _exp2_f32(gc_j * LOG2E)
 
-            # Invert each diagonal block with (I+B)(I+B^2)(I+B^4)(I+B^8).
+            # Stable FP32 forward substitution in each 16x16 diagonal tile.
             br = warp16
-            neg_A = _load_fp32_tile(s_A, br, br, wave_copy_A32, lds_copy32, negate=True)
-            I_acc = _identity_frag(lane)
             z4 = fx.Float32x4(0.0)
-            neg_A_T = _load_fp32_tile(
-                s_A,
-                br,
-                br,
-                wave_copy_B32,
-                lds_copy32,
-                transpose=True,
-                negate=True,
-            )
-            b2 = _mfma16(neg_A, neg_A_T, z4)
-            b2t = _mfma16(neg_A_T, neg_A, z4)
-            b2_o = _accum_to_bf16x4(b2)
-            b2t_o = _accum_to_bf16x4(b2t)
-            b4 = _mfma16(b2t_o, b2_o, z4)
-            b4t = _mfma16(b2_o, b2t_o, z4)
-            b4_o = _accum_to_bf16x4(b4)
-            b4t_o = _accum_to_bf16x4(b4t)
-            C_acc = _mfma16(b4t_o, b4_o, I_acc)
-            C_acc = _mfma16(b4t_o, _accum_to_bf16x4(C_acc), C_acc)
-            C_acc = _mfma16(b2t_o, _accum_to_bf16x4(C_acc), C_acc)
-            C_acc = _mfma16(neg_A, _accum_to_bf16x4(C_acc), C_acc)
-            _store_fp32_tile(s_A, br, br, C_acc, wave_copy_C32, lds_copy32)
-            for it in range_constexpr((16 * 16 + WARP_SIZE - 1) // WARP_SIZE):
-                idx = lane + it * WARP_SIZE
-                rr = idx // 16
-                cc = idx % 16
-                if rr < cc:
-                    s_A[br + rr, br + cc] = zero_f
+            for it in range_constexpr(4):
+                row = lane // 16 + it * 4
+                col = lane % 16
+                value = s_A[br + row, br + col]
+                s_A[br + row, br + col] = (row == col).select(fx.Float32(1.0), -value)
             gpu.barrier()
+            for pivot in range(1, 15):
+                for it in range_constexpr(4):
+                    row = lane // 16 + it * 4
+                    col = lane % 16
+                    if (row > pivot) & (col < pivot):
+                        value = s_A[br + row, br + col]
+                        coeff = s_A[br + row, br + pivot]
+                        previous = s_A[br + pivot, br + col]
+                        s_A[br + row, br + col] = value + coeff * previous
+                gpu.barrier()
 
             # Merge the diagonal inverses in place.
-            sav_L32 = fx.BFloat16x4(0.0)
-            sav_L43 = fx.BFloat16x4(0.0)
-            sav_L42 = fx.BFloat16x4(0.0)
+            sav_L32 = fx.Float32x4(0.0)
+            sav_L43 = fx.Float32x4(0.0)
+            sav_L42 = fx.Float32x4(0.0)
             if warp == 0:
-                sav_L32 = _load_fp32_tile(s_A, 32, 16, wave_copy_A32, lds_copy32)
-                sav_L42 = _load_fp32_tile(s_A, 48, 16, wave_copy_A32, lds_copy32)
+                sav_L32 = _load_full_fp32_tile(s_A, 32, 16, wave_copy_A32, lds_copy32)
+                sav_L42 = _load_full_fp32_tile(s_A, 48, 16, wave_copy_A32, lds_copy32)
             if warp < 2:
-                sav_L43 = _load_fp32_tile(s_A, 48, 32, wave_copy_A32, lds_copy32)
+                sav_L43 = _load_full_fp32_tile(s_A, 48, 32, wave_copy_A32, lds_copy32)
             # Complete aliased block preloads before sibling stores.
             gpu.barrier()
 
@@ -484,82 +491,82 @@ def compile_gdn_prepare(
             kept_c32 = z4
             kept_c31 = z4
             if warp == 0:
-                t = _mfma16(
-                    _load_fp32_tile(s_A, 16, 0, wave_copy_A32, lds_copy32),
-                    _load_fp32_tile(s_A, 0, 0, wave_copy_B32, lds_copy32, True),
+                t = _mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 16, 0, wave_copy_A32, lds_copy32),
+                    _load_full_fp32_tile(s_A, 0, 0, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                kept_c21 = -_mfma16(
-                    _load_fp32_tile(s_A, 16, 16, wave_copy_A32, lds_copy32),
-                    _accum_to_bf16x4(t),
+                kept_c21 = -_mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 16, 16, wave_copy_A32, lds_copy32),
+                    fx.Float32x4(t),
                     z4,
                 )
                 _store_fp32_tile(s_A, 16, 0, kept_c21, wave_copy_C32, lds_copy32)
             if warp == 1:
-                t = _mfma16(
-                    _load_fp32_tile(s_A, 32, 16, wave_copy_A32, lds_copy32),
-                    _load_fp32_tile(s_A, 16, 16, wave_copy_B32, lds_copy32, True),
+                t = _mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 32, 16, wave_copy_A32, lds_copy32),
+                    _load_full_fp32_tile(s_A, 16, 16, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                kept_c32 = -_mfma16(
-                    _load_fp32_tile(s_A, 32, 32, wave_copy_A32, lds_copy32),
-                    _accum_to_bf16x4(t),
+                kept_c32 = -_mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 32, 32, wave_copy_A32, lds_copy32),
+                    fx.Float32x4(t),
                     z4,
                 )
                 _store_fp32_tile(s_A, 32, 16, kept_c32, wave_copy_C32, lds_copy32)
             if warp == 2:
-                t = _mfma16(
-                    _load_fp32_tile(s_A, 48, 32, wave_copy_A32, lds_copy32),
-                    _load_fp32_tile(s_A, 32, 32, wave_copy_B32, lds_copy32, True),
+                t = _mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 48, 32, wave_copy_A32, lds_copy32),
+                    _load_full_fp32_tile(s_A, 32, 32, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                c43 = -_mfma16(
-                    _load_fp32_tile(s_A, 48, 48, wave_copy_A32, lds_copy32),
-                    _accum_to_bf16x4(t),
+                c43 = -_mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 48, 48, wave_copy_A32, lds_copy32),
+                    fx.Float32x4(t),
                     z4,
                 )
                 _store_fp32_tile(s_A, 48, 32, c43, wave_copy_C32, lds_copy32)
             gpu.barrier()
 
             if warp == 0:
-                t = _mfma16(
-                    _load_fp32_tile(s_A, 32, 0, wave_copy_A32, lds_copy32),
-                    _load_fp32_tile(s_A, 0, 0, wave_copy_B32, lds_copy32, True),
+                t = _mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 32, 0, wave_copy_A32, lds_copy32),
+                    _load_full_fp32_tile(s_A, 0, 0, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                t = _mfma16(sav_L32, _accum_to_bf16x4(kept_c21), t)
-                kept_c31 = -_mfma16(
-                    _load_fp32_tile(s_A, 32, 32, wave_copy_A32, lds_copy32),
-                    _accum_to_bf16x4(t),
+                t = _mfma16_bf16x2(sav_L32, fx.Float32x4(kept_c21), t)
+                kept_c31 = -_mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 32, 32, wave_copy_A32, lds_copy32),
+                    fx.Float32x4(t),
                     z4,
                 )
                 _store_fp32_tile(s_A, 32, 0, kept_c31, wave_copy_C32, lds_copy32)
             if warp == 1:
-                t = _mfma16(
-                    _load_fp32_tile(s_A, 48, 16, wave_copy_A32, lds_copy32),
-                    _load_fp32_tile(s_A, 16, 16, wave_copy_B32, lds_copy32, True),
+                t = _mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 48, 16, wave_copy_A32, lds_copy32),
+                    _load_full_fp32_tile(s_A, 16, 16, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                t = _mfma16(sav_L43, _accum_to_bf16x4(kept_c32), t)
-                c42 = -_mfma16(
-                    _load_fp32_tile(s_A, 48, 48, wave_copy_A32, lds_copy32),
-                    _accum_to_bf16x4(t),
+                t = _mfma16_bf16x2(sav_L43, fx.Float32x4(kept_c32), t)
+                c42 = -_mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 48, 48, wave_copy_A32, lds_copy32),
+                    fx.Float32x4(t),
                     z4,
                 )
                 _store_fp32_tile(s_A, 48, 16, c42, wave_copy_C32, lds_copy32)
             gpu.barrier()
 
             if warp == 0:
-                t = _mfma16(
-                    _load_fp32_tile(s_A, 48, 0, wave_copy_A32, lds_copy32),
-                    _load_fp32_tile(s_A, 0, 0, wave_copy_B32, lds_copy32, True),
+                t = _mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 48, 0, wave_copy_A32, lds_copy32),
+                    _load_full_fp32_tile(s_A, 0, 0, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                t = _mfma16(sav_L42, _accum_to_bf16x4(kept_c21), t)
-                t = _mfma16(sav_L43, _accum_to_bf16x4(kept_c31), t)
-                c41 = -_mfma16(
-                    _load_fp32_tile(s_A, 48, 48, wave_copy_A32, lds_copy32),
-                    _accum_to_bf16x4(t),
+                t = _mfma16_bf16x2(sav_L42, fx.Float32x4(kept_c21), t)
+                t = _mfma16_bf16x2(sav_L43, fx.Float32x4(kept_c31), t)
+                c41 = -_mfma16_bf16x2(
+                    _load_full_fp32_tile(s_A, 48, 48, wave_copy_A32, lds_copy32),
+                    fx.Float32x4(t),
                     z4,
                 )
                 _store_fp32_tile(s_A, 48, 0, c41, wave_copy_C32, lds_copy32)
