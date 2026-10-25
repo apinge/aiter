@@ -11,13 +11,12 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
-    invert_sorted_ids,
     sorted_sum,
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.common import (
@@ -843,7 +842,16 @@ def _run_prefill(
     situ_linear_beta: float,
 ):
     gateup_block_m = config.GATEUP_BLOCK_M or config.BLOCK_M
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+    # Opus also returns each route's sorted row; merged repeated expert IDs get -1.
+    (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        cur_out,
+        _,
+        loc_ids,
+    ) = moe_sorting(
         topk_ids,
         topk_weight,
         problem.experts,
@@ -853,6 +861,7 @@ def _run_prefill(
         None,
         None,
         0,
+        output_aux=AUX_SORT_OPUS,
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
@@ -995,18 +1004,6 @@ def _run_prefill(
     else:
         _launch(down_kernel, *down_args)
 
-    loc_ids = torch.empty(
-        [problem.batch, problem.topk],
-        dtype=torch.int32,
-        device=hidden_states.device,
-    )
-    invert_sorted_ids(problem.topk)(
-        sorted_ids,
-        loc_ids,
-        num_valid_ids,
-        sorted_ids.shape[0],
-        problem.batch,
-    )
     sorted_sum(problem.topk, problem.model_dim, output_padding_bytes)(
         loc_ids, gemm2_out, cur_out, problem.batch
     )
