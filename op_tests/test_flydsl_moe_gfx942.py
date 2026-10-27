@@ -34,11 +34,13 @@ from aiter.fused_moe_registry import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
-from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
+from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
     gemm2_8x1_compact as compact,
 )
-from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import sorted_sum
-from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
+from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import sorted_sum
+from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.common import (
+    torch_tensor_to_pointer as _ptr,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -52,7 +54,7 @@ QUANTS = {
     "ptpc": QuantType.per_Token,
 }
 ACTIVATIONS = {"silu": ActivationType.Silu, "swiglu": ActivationType.Swiglu}
-# MI300X then MI308X, the order in which a cached launcher meets a smaller device.
+# Exercise task tables compiled separately for MI300X and MI308X CU counts.
 CU_COUNTS = (304, 80)
 GUARD, CANARY = 64, -123
 # FP8 rounding moves an element by at most 0.28 token RMS from the torch reference.
@@ -66,7 +68,9 @@ PATH_DIFF_LIMIT = 0.1
 
 def guarded_task_buffers(sorted_expert_ids, experts, cu_count):
     """allocate_task_buffers with canaries before and after every buffer."""
-    full, tail = compact.task_capacities(sorted_expert_ids.numel(), experts, cu_count)
+    full, tail = compact.task_capacities(
+        sorted_expert_ids.numel(), experts, cu_count=cu_count
+    )
     storages, buffers = [], []
     for shape in ((full, 2), (tail, 2), (2,)):
         storage = torch.full(
@@ -95,10 +99,8 @@ def check_tasks(blocks, experts, cu_count, full_tasks, tail_tasks, counts):
     tail = sum(size % 4 for size in sizes)
     remainder = full % cu_count
     split = 0
-    if remainder and remainder * compact._SPLIT_DEN < cu_count * compact._SPLIT_NUM:
+    if remainder and remainder * 5 < cu_count * 3:
         split = remainder
-    # The kernel caps the split at the free tail capacity.
-    split = min(split, (tail_tasks.shape[0] - tail) // 4)
     expected = [(full - split) * 256, (tail + 4 * split) * 64]
     assert counts.tolist() == expected, f"counts {counts.tolist()} != {expected}"
     coverage = [0] * len(blocks)
@@ -119,7 +121,7 @@ def check_tasks(blocks, experts, cu_count, full_tasks, tail_tasks, counts):
 def task_scenarios(cu_count):
     """Map a scenario to (experts, [(expert, M64 blocks)]) in metadata order."""
     # Largest remainder of the final full-task CU round that is still split.
-    split = (cu_count * compact._SPLIT_NUM - 1) // compact._SPLIT_DEN
+    split = (cu_count * 3 - 1) // 5
     return {
         "empty": (4, []),
         "tails_only": (8, [(1, 1), (3, 2), (6, 3)]),
@@ -135,8 +137,8 @@ def task_scenarios(cu_count):
     }
 
 
-# One launcher per expert count serves every CU count, like the cached builder.
-build_task_table = functools.cache(compact.build_task_table)
+# This branch specializes task-table launchers by CU count.
+build_task_table = compact.build_task_table
 
 
 @benchmark()
@@ -149,15 +151,13 @@ def test_task_table(scenario, cu_count, buffer_cu_count):
     storages, (full_tasks, tail_tasks, counts) = guarded_task_buffers(
         metadata, experts, buffer_cu_count
     )
-    launcher = build_task_table(experts)
+    launcher = build_task_table(experts, cu_count=cu_count)
     pointers = [_ptr(t) for t in (metadata, valid_rows, full_tasks, tail_tasks, counts)]
 
     def build():
         _run_compiled(
             launcher,
             *pointers,
-            cu_count,
-            tail_tasks.shape[0],
             torch.cuda.current_stream(),
         )
         return counts
@@ -165,8 +165,6 @@ def test_task_table(scenario, cu_count, buffer_cu_count):
     _, us = run_perftest(build)
     full, tail = check_tasks(blocks, experts, cu_count, full_tasks, tail_tasks, counts)
     check_guards(storages)
-    if scenario == "tail_capacity" and buffer_cu_count == cu_count:
-        assert tail == tail_tasks.shape[0], "tail capacity is not tight"
     nbytes = metadata.nbytes + valid_rows.nbytes + 8 * (full + tail) + counts.nbytes
     return {
         "blocks": len(blocks),
@@ -195,9 +193,9 @@ def test_sorted_sum(token, model_dim, topk, padding):
         model_dim,
         dtype,
         64,
-        output=storage[GUARD:-GUARD].view(token, model_dim),
         output_aux=AUX_SORT_OPUS,
     )
+    output = storage[GUARD:-GUARD].view(token, model_dim)
     valid = loc_ids.view(token, topk) >= 0
     assert int((~valid).sum()) == topk - 1, "repeated expert IDs kept extra routes"
     # Specialized Down rows carry padding that holds canaries the sum must skip.
@@ -238,25 +236,18 @@ def test_sorted_sum(token, model_dim, topk, padding):
 def test_config_strings():
     for encoded in get_tune_space():
         assert Config.from_string(encoded).to_string() == encoded
-    # Rows tuned before the Down suffix existed keep loading as the default Down.
     for legacy in ("16_16_16_False", "64_128_128_True", "64_256_128_True"):
-        assert Config.from_string(legacy) == Config.from_string(f"{legacy}:default:0")
-    # Tiles without the direct-decoding flag keep their meaning.
-    assert Config.from_string("16_16_16_False_False:default:0") == Config.from_string(
-        "16_16_16_False:default:0"
-    )
+        parsed = Config.from_string(legacy)
+        assert parsed.down_path == "default"
+        assert parsed.GATEUP_BLOCK_M is None
+        assert parsed.down_output_padding_bytes is None
     for invalid in (
         "64_256_128_True:default",
-        "64_256_128_True:default:0:0",
         "64_256_128_Maybe",
         "64_256_True",
-        "64_256_128_True:default:128",
-        "64_256_128_True:8x2:128",
-        "16_16_16_False:8x1_compact:128",
-        "16_16_16_False_Maybe:default:0",
-        "16_16_16_False_True_False:default:0",
-        "16_16_16_True_True:default:0",
-        "16_16_16_False_True:1x4_64x256:128",
+        "64_256_128_True:8x2:64:128",
+        "16_16_16_False_Maybe",
+        "16_16_16_False_True_False",
     ):
         try:
             Config.from_string(invalid)
@@ -363,7 +354,11 @@ def make_case(
 class GuardedTaskBuffers:
     """Replaces allocate_task_buffers and keeps the last allocation for checks."""
 
-    def __call__(self, sorted_expert_ids, experts, cu_count):
+    def __call__(
+        self, sorted_expert_ids, experts, *, cu_count=None, min_tail_utilization=0.6
+    ):
+        if cu_count is None:
+            cu_count = compact.device_cu_count(sorted_expert_ids.device)
         self.metadata, self.cu_count = sorted_expert_ids, cu_count
         self.storages, self.buffers = guarded_task_buffers(
             sorted_expert_ids, experts, cu_count
@@ -442,16 +437,6 @@ def check_moe(
     if parsed.down_path == "8x1_compact":
         device_cu = get_cu_num()
         output, tasks = run_compact(impl, request, experts, device_cu)
-        # The cached launcher must stay in bounds and correct for the other CU count.
-        for cu_count in CU_COUNTS:
-            if cu_count != device_cu:
-                with patch(
-                    "aiter.ops.flydsl.fused_moe_gfx942.get_cu_num",
-                    return_value=cu_count,
-                ):
-                    other, _ = run_compact(impl, request, experts, cu_count)
-                diff = rms_error(output, other, rms)
-                assert diff < PATH_DIFF_LIMIT, f"{config} at {cu_count} CUs: {diff=}"
     else:
         output = impl(request)
     err = check_output(reference, output, config)
@@ -532,7 +517,7 @@ EDGE_CASES = [
             "ptpc",
             "silu",
             routing,
-            f"64_256_128_True:{path}:128",
+            f"64_256_128_True:{path}:64:128",
         )
         for routing in ("random", "hot")
         for path in ("8x1_compact", "1x4_64x256")
@@ -541,9 +526,9 @@ EDGE_CASES = [
     *(
         (16384, 1024, 384, 1, 1, "per_tensor", "silu", "hot", config)
         for config in (
-            "64_256_128_True:8x1_compact:128",
-            "64_256_128_True:1x4_64x256:128",
-            "64_256_128_True:default:0",
+            "64_256_128_True:8x1_compact:64:128",
+            "64_256_128_True:1x4_64x256:64:128",
+            "64_256_128_True:default:64:none",
         )
     ),
     # Every row padding of the specialized Down paths, reduced with the same stride.
@@ -557,7 +542,7 @@ EDGE_CASES = [
             "ptpc",
             "silu",
             "random",
-            f"64_256_128_True:{path}:{padding}",
+            f"64_256_128_True:{path}:64:{padding}",
         )
         for path in ("8x1_compact", "1x4_64x256")
         for padding in (0, 32, 64)
@@ -566,8 +551,8 @@ EDGE_CASES = [
     *(
         (2048, 2560, 320, 513, 11, quant, "silu", "padding", config)
         for quant, config in (
-            ("no", "64_128_128_True:default:0"),
-            ("ptpc", "64_128_256_True:1x4_64x256:128"),
+            ("no", "64_128_128_True:default:64:none"),
+            ("ptpc", "64_128_256_True:1x4_64x256:64:128"),
         )
     ),
 ]
@@ -606,9 +591,7 @@ def main():
             test_task_table(scenario, cu_count, cu_count)
             for cu_count in CU_COUNTS
             for scenario in task_scenarios(cu_count)
-        ]
-        # Buffers sized for 80 CUs under a 304-CU split: the device guard caps it.
-        + [test_task_table("cu_dependent", *CU_COUNTS)],
+        ],
     )
     summarize(
         "Padded sorted reduction",

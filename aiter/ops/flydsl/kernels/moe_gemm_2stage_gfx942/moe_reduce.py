@@ -122,4 +122,3 @@ sorted_sum.cache_info = _sorted_sum_cached.cache_info
 def compile_moe_reduction(*, topk, model_dim, row_padding_bytes=None):
     """Build and cache the route reduction callable for one static configuration."""
     return sorted_sum(topk, model_dim, row_padding_bytes)
-

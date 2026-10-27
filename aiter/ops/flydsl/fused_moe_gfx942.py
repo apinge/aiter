@@ -209,8 +209,7 @@ class Config:
         else:
             if problem.inter_dim not in (192, 256, 320, 384, 512, 640):
                 return (
-                    "8x1 paths require inter_dim in "
-                    "{192, 256, 320, 384, 512, 640}"
+                    "8x1 paths require inter_dim in " "{192, 256, 320, 384, 512, 640}"
                 )
             expected_block_m = 256 if self.down_path == "8x1" else 64
             if self.BLOCK_M != expected_block_m or gateup_block_m != 64:
@@ -687,9 +686,7 @@ def precompile_flydsl_moe(
             )
 
             metadata_capacity = (
-                batch * topk + experts * config.BLOCK_M - topk
-                + config.BLOCK_M
-                - 1
+                batch * topk + experts * config.BLOCK_M - topk + config.BLOCK_M - 1
             ) // config.BLOCK_M
             full_capacity, tail_capacity = task_capacities(
                 metadata_capacity,
@@ -707,16 +704,6 @@ def precompile_flydsl_moe(
             )
         compile_launcher(down, *down_args, 0)
 
-        invert = invert_sorted_ids(topk)
-        compile_launcher(
-            invert._flydsl_executable,
-            _ptr(int32),
-            _ptr(int32),
-            _ptr(int32),
-            fx.Uint32(batch * topk),
-            fx.Uint32(batch),
-            0,
-        )
         reduction = sorted_sum(topk, model_dim, config.down_output_padding_bytes)
         compile_launcher(
             reduction._flydsl_executable,
