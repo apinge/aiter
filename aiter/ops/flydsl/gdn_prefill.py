@@ -36,6 +36,8 @@ def flydsl_gdn_prefill_front(
     assert qkvz.dtype == torch.bfloat16 and qkvz.stride(-1) == 1
     assert qkvz.shape[1] >= 2 * H * D + HV * D
     assert conv_weight.is_contiguous() and conv_weight.shape[-1] == 4
+    assert conv_weight.dtype == torch.bfloat16
+    assert conv_weight.shape[0] == 2 * H * D + HV * D
     assert conv_state.dtype == torch.bfloat16 and conv_state.stride(-1) == 1
     assert conv_state.stride(-2) == 3 and conv_state.shape[-1] == 3
     N = cache_indices.numel()

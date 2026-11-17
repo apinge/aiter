@@ -34,13 +34,25 @@ def _arrival_counter(device, n: int) -> torch.Tensor:
     """Zero-initialised per-(token, k-head) counters; the kernel resets what it uses."""
     buf = _COUNTERS.get(str(device))
     if buf is None or buf.numel() < n:
-        buf = torch.zeros(max(n, 4096), dtype=torch.int32, device=device)
+        # A zero-fill recorded during graph capture would not run before other graphs
+        # use the buffer, so it must be created eagerly (warm-up runs before capture).
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "GDN decode arrival counter must be allocated before CUDA graph capture"
+        )
+        buf = torch.zeros(max(n, 1 << 16), dtype=torch.int32, device=device)
         _COUNTERS[str(device)] = buf
     return buf
 
 
 def _dt(t: torch.Tensor) -> str:
+    assert t.dtype in (torch.bfloat16, torch.float32)
     return "bf16" if t.dtype == torch.bfloat16 else "f32"
+
+
+def _check_params(A_log: torch.Tensor, dt_bias: torch.Tensor, H: int, HV: int):
+    assert A_log.dtype == torch.float32 and A_log.is_contiguous()
+    assert dt_bias.is_contiguous() and A_log.numel() == dt_bias.numel() == HV
+    assert H > 0 and HV % H == 0
 
 
 def _check_state(initial_state: torch.Tensor, scale: float):
@@ -68,6 +80,9 @@ def fused_recurrent_gated_delta_rule_packed_decode_flydsl(
     HV, V, K = _check_state(initial_state, scale)
     H = (mixed_qkv.shape[1] - HV * V) // (2 * K)
     assert mixed_qkv.stride(-1) == 1 and a.stride(-1) == 1 and b.stride(-1) == 1
+    assert mixed_qkv.shape[1] == 2 * H * K + HV * V
+    assert mixed_qkv.dtype == a.dtype == b.dtype == out.dtype == torch.bfloat16
+    _check_params(A_log, dt_bias, H, HV)
     assert out.is_contiguous() and out.shape == (B, 1, HV, V)
     assert ssm_state_indices.dtype == torch.int32
     exe = create_gdn_decode_fused_kernel(
@@ -108,6 +123,8 @@ def fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl(
     assert projected_qkvz.stride(-1) == 1 and projected_ba.stride(-1) == 1
     assert projected_qkvz.shape[1] >= 2 * H * K + 2 * HV * V
     assert projected_ba.shape[1] >= 2 * HV
+    assert projected_qkvz.dtype == projected_ba.dtype == out.dtype == torch.bfloat16
+    _check_params(A_log, dt_bias, H, HV)
     assert conv_weights.is_contiguous() and conv_weights.shape[-1] == 4
     assert conv_weights.dtype == torch.bfloat16
     assert conv_states.dim() == 3 and conv_states.shape[-1] == 3
@@ -118,6 +135,9 @@ def fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl(
     assert out.is_contiguous() and out.numel() == B * HV * V
     if write_z:
         assert z_out.is_contiguous() and z_out.numel() == B * HV * V
+        assert z_out.dtype == torch.bfloat16
+    if fuse_norm:
+        assert norm_weight.dtype == torch.bfloat16 and norm_weight.numel() == V
     exe = create_gdn_decode_fused_kernel(
         H, HV, K, True, fuse_norm, "f32", _dt(dt_bias), _NUM_WARPS, _WARP_THREADS_K,
         float(norm_eps), 20.0, 0, write_z,
