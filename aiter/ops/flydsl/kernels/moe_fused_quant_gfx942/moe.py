@@ -15,7 +15,8 @@ import os
 import torch
 
 import aiter
-from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
+from aiter.fused_moe import _PADDED_M_TIERS, AUX_SORT_OPUS, get_padded_M, moe_sorting
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.fused_moe_gfx942 import (
     Config,
     _activation_scalars,
@@ -38,12 +39,17 @@ _FLYDSL_PREFIX = "impl__flydsl_gfx942__"
 
 
 @functools.cache
-def _tuned_rows(csv_path: str):
+def _tuned_rows(csv_path: str, gfx: str, cu_num: int):
+    """{(model_dim, inter, experts, topk): {token: FlyDSL config string}} for this device."""
     rows = {}
     with open(csv_path) as f:
         for r in csv.DictReader(f):
             name = r["kernelName1"]
-            if not name.startswith(_FLYDSL_PREFIX):
+            if (
+                not name.startswith(_FLYDSL_PREFIX)
+                or r["gfx"] != gfx
+                or int(r["cu_num"]) != cu_num
+            ):
                 continue
             key = (
                 int(r["model_dim"]),
@@ -55,23 +61,34 @@ def _tuned_rows(csv_path: str):
     return rows
 
 
-def down_config(
+def prefill_config(
     *, m: int, model_dim: int, inter: int, experts: int, topk: int
-) -> Config:
-    """The tuned whole-graph config of the smallest token bucket >= m (largest if none)."""
-    table = _tuned_rows(_TUNED_CSV).get((model_dim, inter, experts, topk))
-    if not table:
-        raise KeyError(
-            f"no tuned FlyDSL prefill row for {(model_dim, inter, experts, topk)}"
-        )
-    buckets = sorted(table)
-    pick = next((b for b in buckets if b >= m), buckets[-1])
-    cfg = Config.from_string(table[pick])
+) -> Config | None:
+    """The tuned BLOCK_M=64 FlyDSL prefill config for m rows, picked with fused_moe's token
+    bucketing (get_padded_M plus its tier fallback); None when this shape has none."""
+    table = _tuned_rows(_TUNED_CSV, get_gfx_runtime(), get_cu_num()).get(
+        (model_dim, inter, experts, topk), {}
+    )
+    padded = get_padded_M(m)
+    candidates = [padded] + [t for t in reversed(_PADDED_M_TIERS) if t < padded]
+    pick = next((table[t] for t in candidates if t in table), None)
+    if pick is None:
+        return None
+    cfg = Config.from_string(pick)
     if not cfg.use_prefill or cfg.BLOCK_M != _GATEUP_BLOCK_M:
-        raise ValueError(
-            f"tuned row {table[pick]!r} is not a BLOCK_M=64 prefill config"
-        )
+        return None
     return cfg
+
+
+def prefill_moe_supported(
+    *, m: int, model_dim: int, inter: int, experts: int, topk: int
+) -> bool:
+    return (
+        prefill_config(
+            m=m, model_dim=model_dim, inter=inter, experts=experts, topk=topk
+        )
+        is not None
+    )
 
 
 # Occupancy per intermediate size: inter 192 needs 260 VGPRs by default (1 wave/SIMD); capped
@@ -118,9 +135,14 @@ def prefill_moe(
     inter = n13 // 2
     topk = topk_ids.shape[1]
     if config is None:
-        config = down_config(
+        config = prefill_config(
             m=m, model_dim=model_dim, inter=inter, experts=experts, topk=topk
         )
+        if config is None:
+            raise ValueError(
+                f"no tuned FlyDSL prefill config for m={m} "
+                f"{(model_dim, inter, experts, topk)}; check prefill_moe_supported"
+            )
     (
         sorted_ids,
         sorted_weights,
