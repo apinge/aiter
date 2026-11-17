@@ -645,6 +645,8 @@ def precompile_flydsl_moe(
             batch,
             1,
             *activation_scalars,
+            0,  # q_out (FUSE_QUANT only)
+            0,  # q_scale (FUSE_QUANT only)
             0,
         )
 
@@ -908,6 +910,8 @@ def _run_prefill(
         problem.batch,
         task_num,
         *activation_scalars,
+        0,  # q_out (FUSE_QUANT only)
+        0,  # q_scale (FUSE_QUANT only)
     )
 
     if weight_dtype_str == "fp8":
