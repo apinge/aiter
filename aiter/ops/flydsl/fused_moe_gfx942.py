@@ -621,16 +621,25 @@ def precompile_flydsl_moe(
         )
 
     if config.use_prefill:
-        gateup_block_m = config.GATEUP_BLOCK_M or config.BLOCK_M
-        gateup = compile_kernel(
-            stage="gateup",
-            alg="prefill_1x4",
-            block_m=gateup_block_m,
-            block_n=config.BLOCK_N,
-            act_quant_type_str=quant_type,
-            BLOCK_TILE_SIZE_K=config.BLOCK_K,
-            METADATA_TILE_SIZE_M=config.BLOCK_M,
-        )
+        if _use_fused_gateup_quant(
+            config, 2 * inter_dim, weight_dtype, quant_type, activation, None
+        ):
+            gateup = _fused_gateup_quant_kernel(
+                gateup_dim=2 * inter_dim,
+                model_dim=model_dim,
+                topk=topk,
+                experts=experts,
+            )
+        else:
+            gateup = compile_kernel(
+                stage="gateup",
+                alg="prefill_1x4",
+                block_m=config.GATEUP_BLOCK_M or config.BLOCK_M,
+                block_n=config.BLOCK_N,
+                act_quant_type_str=quant_type,
+                BLOCK_TILE_SIZE_K=config.BLOCK_K,
+                METADATA_TILE_SIZE_M=config.BLOCK_M,
+            )
         compile_launcher(
             gateup,
             _ptr(byte if is_fp8 else bf16),
@@ -719,7 +728,8 @@ def precompile_flydsl_moe(
 
     use_batch1_algorithm = batch == 1 or config.use_batch1_algorithm
     if use_batch1_algorithm:
-        fused_down_clear = is_mxfp4 and batch > 1
+        # The gate-up kernel zeroes the output for down instead of a separate fill.
+        fused_down_clear = is_fp8 or (is_mxfp4 and batch > 1)
         gate_layouts = (False, True) if is_mxfp4 else (False,)
         gate_block_n = 64 if is_mxfp4 and batch >= 4 else 32
         for gate_up_interleaved in gate_layouts:
@@ -747,7 +757,7 @@ def precompile_flydsl_moe(
             stage="down",
             alg="batch1",
             block_m=16,
-            block_n=32 if fused_down_clear else 64,
+            block_n=32 if is_mxfp4 and batch > 1 else 64,
         )
         compile_launcher(
             down,
@@ -814,6 +824,50 @@ def precompile_flydsl_moe(
     )
 
 
+# PTPC fp8 gate-up quantizes its own activated output per route when one CTA holds a full
+# intermediate row (BN == N): bit-exact with the separate per-token quant it replaces.
+# Measured faster on MI308X at N = 384 and 640 (Qwen3.8 flash-next TP4 / TP2).
+_FUSED_QUANT_MAX_N = 640
+_FUSED_QUANT_BLOCK_M = 64
+
+
+def _use_fused_gateup_quant(
+    config, gateup_dim, weight_dtype_str, quant_type_str, activation_str, swiglu_limit
+):
+    return (
+        weight_dtype_str == "fp8"
+        and quant_type_str == "ptpc"
+        and activation_str == "silu"
+        and swiglu_limit is None
+        and config.BLOCK_M == _FUSED_QUANT_BLOCK_M
+        and gateup_dim % 128 == 0
+        and gateup_dim <= _FUSED_QUANT_MAX_N
+    )
+
+
+def _fused_gateup_quant_kernel(*, gateup_dim, model_dim, topk, experts):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_moe_gemm1
+
+    return compile_moe_gemm1(
+        N=gateup_dim,
+        K=model_dim,
+        weight_dtype="fp8",
+        weight_quant_type="ptpc",
+        TOPK=topk,
+        BLOCK_TILE_SIZE_M=_FUSED_QUANT_BLOCK_M,
+        BLOCK_TILE_SIZE_N=gateup_dim,
+        tile_k=128,
+        alg="prefill_1x4",
+        E=experts,
+        act_quant_type="ptpc",
+        activation="silu",
+        METADATA_TILE_SIZE_M=_FUSED_QUANT_BLOCK_M,
+        FUSE_QUANT=True,
+        # N = 384 needs 260 VGPRs uncapped; capped it fits 256 with no spills (2 waves/SIMD).
+        WAVES_PER_EU=2 if gateup_dim <= 384 else 0,
+    )
+
+
 def _run_prefill(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -872,26 +926,57 @@ def _run_prefill(
         gateup_in = hidden_states
         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
-    gemm1_out = _gateup_output(hidden_states, problem)
-    gateup_kernel = _get_compiled_kernel(
-        N=problem.gateup_dim,
-        K=problem.hidden_dim,
-        weight_dtype_str=weight_dtype_str,
-        quant_type_str=problem.quant_type,
-        TOPK=problem.topk,
-        BLOCK_TILE_SIZE_M=gateup_block_m,
-        BLOCK_TILE_SIZE_N=config.BLOCK_N,
-        BLOCK_TILE_SIZE_K=config.BLOCK_K,
-        stage="gateup",
-        alg="prefill_1x4",
-        E=problem.experts,
-        act_quant_type_str=act_quant_type_str,
-        activation_str=activation_str,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        METADATA_TILE_SIZE_M=config.BLOCK_M,
+    fuse_quant = _use_fused_gateup_quant(
+        config,
+        problem.gateup_dim,
+        weight_dtype_str,
+        problem.quant_type,
+        activation_str,
+        swiglu_limit,
     )
+    if fuse_quant:
+        down_in = torch.empty(
+            problem.batch * problem.topk,
+            problem.inter_dim,
+            dtype=w2.dtype,
+            device=hidden_states.device,
+        )
+        down_in_scale = torch.empty(
+            problem.batch * problem.topk,
+            1,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        gemm1_out = down_in  # unused by the fused epilogue
+        quant_out = (down_in.data_ptr(), down_in_scale.data_ptr())
+        gateup_kernel = _fused_gateup_quant_kernel(
+            gateup_dim=problem.gateup_dim,
+            model_dim=problem.model_dim,
+            topk=problem.topk,
+            experts=problem.experts,
+        )
+    else:
+        gemm1_out = _gateup_output(hidden_states, problem)
+        quant_out = (0, 0)
+        gateup_kernel = _get_compiled_kernel(
+            N=problem.gateup_dim,
+            K=problem.hidden_dim,
+            weight_dtype_str=weight_dtype_str,
+            quant_type_str=problem.quant_type,
+            TOPK=problem.topk,
+            BLOCK_TILE_SIZE_M=gateup_block_m,
+            BLOCK_TILE_SIZE_N=config.BLOCK_N,
+            BLOCK_TILE_SIZE_K=config.BLOCK_K,
+            stage="gateup",
+            alg="prefill_1x4",
+            E=problem.experts,
+            act_quant_type_str=act_quant_type_str,
+            activation_str=activation_str,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            METADATA_TILE_SIZE_M=config.BLOCK_M,
+        )
     task_num = int(sorted_expert_ids.shape[0])
     activation_scalars = _activation_scalars(
         activation_str, situ_beta, situ_linear_beta, swiglu_limit
@@ -910,11 +995,12 @@ def _run_prefill(
         problem.batch,
         task_num,
         *activation_scalars,
-        0,  # q_out (FUSE_QUANT only)
-        0,  # q_scale (FUSE_QUANT only)
+        *quant_out,
     )
 
-    if weight_dtype_str == "fp8":
+    if fuse_quant:
+        pass
+    elif weight_dtype_str == "fp8":
         down_in, down_in_scale = quant_func(
             gemm1_out.view(problem.batch * problem.topk, -1),
             scale=None,
@@ -1021,7 +1107,8 @@ def _run_batch1(
         "bf16" if w1.dtype == torch.bfloat16 else "fp4" if is_mxfp4 else "fp8"
     )
     force_batch1_path = problem.batch > 1
-    fused_down_clear = is_mxfp4 and force_batch1_path
+    # The gate-up kernel zeroes the output for down instead of a separate fill.
+    fused_down_clear = weight_dtype_str == "fp8" or (is_mxfp4 and force_batch1_path)
     topk_weight = (
         topk_weight if topk_weight.dtype == torch.float32 else topk_weight.float()
     )
