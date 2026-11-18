@@ -76,7 +76,15 @@ def is_flydsl_available() -> bool:
     # On other archs (e.g. gfx1100 / RDNA3) importing the kernel modules crashes
     # during config registration, so report flydsl as unavailable there instead
     # of failing the import.
-    from flydsl.runtime.device import get_rocm_arch
-    from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+    try:
+        from flydsl.runtime.device import get_rocm_arch
+        from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+    except ImportError as e:
+        # A flydsl release without these names cannot run aiter's flydsl kernels either;
+        # report it unavailable so tuned flydsl rows fall back instead of raising.
+        from aiter import logger
+
+        logger.warning(f"[FlyDSL] incompatible flydsl install, using CK/CKTile: {e}")
+        return False
 
     return get_rocm_arch() in SMEM_CAPACITY_MAP
