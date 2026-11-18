@@ -9,8 +9,7 @@ fused_recurrent_gated_delta_rule_packed_decode_flydsl
 fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl
     Same recurrence, but it starts from the in_proj outputs: the q/k/v/z/b/a unpack and
     the causal conv1d update (with the indexed conv-state shift) run in the same kernel.
-    Writes o [B, 1, HV, V] and, if given, a contiguous z [B, HV, V] for the gated norm;
-    with ``norm_weight`` it applies the gated RMSNorm itself and writes [B, HV * V].
+    Writes o [B, 1, HV, V] and, if given, a contiguous z [B, HV, V] for the gated norm.
 """
 
 from __future__ import annotations
@@ -25,7 +24,6 @@ __all__ = [
     "fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl",
 ]
 
-_NUM_WARPS = 4
 _WARP_THREADS_K = 8
 _COUNTERS: dict = {}
 
@@ -85,13 +83,11 @@ def fused_recurrent_gated_delta_rule_packed_decode_flydsl(
     _check_params(A_log, dt_bias, H, HV)
     assert out.is_contiguous() and out.shape == (B, 1, HV, V)
     assert ssm_state_indices.dtype == torch.int32
-    exe = create_gdn_decode_fused_kernel(
-        H, HV, K, False, False, "f32", _dt(dt_bias), _NUM_WARPS, _WARP_THREADS_K
-    )
+    exe = create_gdn_decode_fused_kernel(H, HV, K, False, _dt(dt_bias), _WARP_THREADS_K)
     _run_compiled(
         exe,
         mixed_qkv, b, a, mixed_qkv, mixed_qkv, ssm_state_indices, A_log, dt_bias,
-        initial_state, ssm_state_indices, dt_bias, out, out,
+        initial_state, ssm_state_indices, out, out,
         mixed_qkv.stride(0), b.stride(0), a.stride(0), 0, 0, 0,
         initial_state.stride(0), HV * V, B, torch.cuda.current_stream(),
     )
@@ -111,8 +107,6 @@ def fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl(
     ssm_state_indices: torch.Tensor,
     num_k_heads: int,
     z_out: torch.Tensor | None = None,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float = 1e-6,
     use_qk_l2norm_in_kernel: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``ssm_state_indices`` indexes both the SSM and the conv state pools (-1 = pad)."""
@@ -130,24 +124,19 @@ def fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl(
     assert conv_states.dim() == 3 and conv_states.shape[-1] == 3
     assert conv_states.dtype == torch.bfloat16
     assert ssm_state_indices.dtype == torch.int32
-    fuse_norm = norm_weight is not None
-    write_z = (not fuse_norm) and z_out is not None
+    write_z = z_out is not None
     assert out.is_contiguous() and out.numel() == B * HV * V
     if write_z:
         assert z_out.is_contiguous() and z_out.numel() == B * HV * V
         assert z_out.dtype == torch.bfloat16
-    if fuse_norm:
-        assert norm_weight.dtype == torch.bfloat16 and norm_weight.numel() == V
     exe = create_gdn_decode_fused_kernel(
-        H, HV, K, True, fuse_norm, "f32", _dt(dt_bias), _NUM_WARPS, _WARP_THREADS_K,
-        float(norm_eps), 20.0, 0, write_z,
+        H, HV, K, True, _dt(dt_bias), _WARP_THREADS_K, write_z=write_z
     )
     _run_compiled(
         exe,
         projected_qkvz, projected_ba, projected_ba, conv_weights, conv_states,
         _arrival_counter(projected_qkvz.device, B * H), A_log, dt_bias, initial_state,
-        ssm_state_indices, norm_weight if fuse_norm else dt_bias, out,
-        z_out if write_z else out,
+        ssm_state_indices, out, z_out if write_z else out,
         projected_qkvz.stride(0), projected_ba.stride(0), projected_ba.stride(0),
         conv_states.stride(0), conv_states.stride(1), conv_states.stride(2),
         initial_state.stride(0), HV * V, B, torch.cuda.current_stream(),

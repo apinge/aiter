@@ -821,25 +821,14 @@ def chunk_fwd_o_opt(
 # =====================================================================
 
 
-# gfx942 (64 KB LDS): the generic list stops at BK/BV=64, which splits V and recomputes
-# q.k^T per V tile. A full-V tile (BV=128) with BK=64 and a single stage is ~30% faster
-# on MI308X for the Qwen3.8 GDN shapes (bit-identical output), so search a short list
-# that leads with it instead of the 54-entry generic product.
-_OPT_VK_GFX942_CONFIGS = [
-    (64, 128, 4, 1),
-    (32, 128, 4, 2),
-    (32, 128, 4, 1),
-    (32, 64, 4, 2),
-]
-
-
-def _opt_vk_configs():
-    if not check_shared_mem() and not IS_NVIDIA_HOPPER:
-        return [
-            triton.Config({"BK": bk, "BV": bv}, num_warps=nw, num_stages=ns)
-            for bk, bv, nw, ns in _OPT_VK_GFX942_CONFIGS
-        ]
-    return [
+@triton.heuristics(
+    {
+        "USE_G": lambda args: args["g"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.autotune(
+    configs=[
         triton.Config(
             {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
         )
@@ -848,16 +837,13 @@ def _opt_vk_configs():
         for num_warps in NUM_WARPS
         for num_stages in [2, 3, 4]
     ]
-
-
-@triton.heuristics(
-    {
-        "USE_G": lambda args: args["g"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
-@triton.autotune(
-    configs=_opt_vk_configs(),
+    # BKV_LIST stops at 64 on 64 KB-LDS GPUs (e.g. gfx942), which splits V and recomputes
+    # q.k^T per V tile; a full-V single-stage tile still fits and is ~30% faster there.
+    + (
+        []
+        if check_shared_mem()
+        else [triton.Config({"BK": 64, "BV": 128}, num_warps=4, num_stages=1)]
+    ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )

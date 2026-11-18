@@ -14,8 +14,8 @@ Per workgroup, in issue order:
   3. gating (softplus / exp decay, sigmoid beta rounded to the input dtype like the
      Triton kernel), q/k L2 norm,
   4. recurrent update h = h*exp(g); v' = (v - h.k)*beta; h += k v'^T; o = h.q,
-  5. output: o (bf16, [B, 1, HV, V]) or, with FUSE_NORM, the gated RMSNorm of the
-     per-head output y = o * rsqrt(mean(o^2) + eps) * w * sigmoid(z) ([B, HV*V]).
+  5. output: o (bf16, [B, 1, HV, V]) and, with WRITE_Z, a contiguous z [B, HV, V] for the
+     caller's gated norm.
 Pad slots (index < 0) write a zero output and leave both caches untouched.
 """
 
@@ -25,7 +25,6 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import gpu as mlir_gpu
 from flydsl._mlir.dialects import llvm, scf
 from flydsl._mlir.dialects import vector as mlir_vector
 from flydsl.expr import range_constexpr
@@ -66,13 +65,6 @@ def _store_i32(addr_i64, val):
         ordering=llvm.AtomicOrdering.monotonic,
         syncscope="agent",
     )
-
-
-def _shfl_xor(x, off):
-    return mlir_gpu.ShuffleOp(
-        _to_raw(x), _to_raw(fx.Int32(off)), _to_raw(fx.Int32(_WARP)), mode="xor"
-    ).shuffleResult
-
 
 
 def _dpp_f32(src, ctrl: int):
@@ -145,22 +137,17 @@ def create_gdn_decode_fused_kernel(
     num_v_heads: int,
     head_dim: int = 128,
     fuse_conv: bool = True,
-    fuse_norm: bool = True,
-    state_dtype: str = "f32",
     dt_bias_dtype: str = "bf16",
-    num_warps: int = 4,
     warp_threads_k: int = 8,
-    norm_eps: float = 1e-6,
     softplus_threshold: float = 20.0,
-    waves_per_eu: int = 0,
     write_z: bool = False,
 ):
     H, HV, D = num_k_heads, num_v_heads, head_dim
     RATIO = HV // H
     assert HV % H == 0 and D == 128
-    assert state_dtype == "f32"
-    assert not write_z or (fuse_conv and not fuse_norm)
+    assert not write_z or fuse_conv
     VPT = 4  # f32 values per lane per state transaction (16 B)
+    num_warps = 4  # one thread per q/v channel plus one per k channel: NT = 2 * D
     NT = num_warps * _WARP
     WTK = warp_threads_k
     WTV = _WARP // WTK
@@ -174,8 +161,7 @@ def create_gdn_decode_fused_kernel(
     dt_bias_is_bf16 = dt_bias_dtype == "bf16"
 
     name = (
-        f"gdn_decode_fused_h{H}x{HV}_d{D}_c{int(fuse_conv)}n{int(fuse_norm)}"
-        f"_{num_warps}w{WTV}x{WTK}"
+        f"gdn_decode_fused_h{H}x{HV}_d{D}_c{int(fuse_conv)}_{num_warps}w{WTV}x{WTK}"
     ) + ("_z" if write_z else "")
     assert WTK <= 16
 
@@ -183,8 +169,6 @@ def create_gdn_decode_fused_kernel(
     class SharedStorage:
         qk: fx.Array[fx.Float32, 2 * D, 16]
         v: fx.Array[fx.Float32, 2 * D, 16]
-        o: fx.Array[fx.Float32, D, 16]
-        red: fx.Array[fx.Float32, 16, 16]
         flag: fx.Array[fx.Int32, 4, 16]
 
     @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
@@ -199,7 +183,6 @@ def create_gdn_decode_fused_kernel(
         dt_bias_mem: fx.Tensor,
         state_mem: fx.Tensor,  # fp32 ssm state pool, [slot, HV, V, K] inner contiguous
         indices_mem: fx.Tensor,  # int32 [B]
-        norm_w_mem: fx.Tensor,  # [D] bf16 (fuse_norm)
         out_mem: fx.Tensor,  # bf16
         z_out_mem: fx.Tensor,  # bf16 [B, HV, V] contiguous (write_z)
         stride_x_tok: fx.Int32,
@@ -213,7 +196,6 @@ def create_gdn_decode_fused_kernel(
     ):
         x = GTensor(x_mem, dtype=T.bf16, shape=(-1,))
         conv_w = GTensor(conv_w_mem, dtype=T.bf16, shape=(-1,))
-        norm_w = GTensor(norm_w_mem, dtype=T.bf16, shape=(-1,))
         out = GTensor(out_mem, dtype=T.bf16, shape=(-1,))
 
         shared = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -221,8 +203,6 @@ def create_gdn_decode_fused_kernel(
         q_lds = qk_lds
         k_lds = qk_lds + fx.Int32(D)  # q at [0, D), k at [D, 2D)
         v_lds = shared.v.ptr
-        o_lds = shared.o.ptr
-        red_lds = shared.red.ptr
         flag_lds = shared.flag.ptr
 
         tid = fx.thread_idx.x
@@ -277,13 +257,9 @@ def create_gdn_decode_fused_kernel(
             cv = v_ch * stride_conv_ch
             s_qk = [fx.Float32(cs[cqk + fx.Int32(j) * stride_conv_w]) for j in range(3)]
             s_v = [fx.Float32(cs[cv + fx.Int32(j) * stride_conv_w]) for j in range(3)]
-        if fx.const_expr(fuse_norm or write_z):
+        if fx.const_expr(write_z):
             z_ch = fx.Int32(QK_DIM + HV * D) + hv * fx.Int32(D) + ch_local
             r_z_bf = fx.BFloat16(x[row_x + z_ch])
-            r_z = fx.Float32(r_z_bf)
-        if fx.const_expr(fuse_norm):
-            r_nw = fx.Float32(norm_w[ch_local])
-        if fx.const_expr(write_z):
             # z rides along so the caller's gated norm reads a contiguous [B, HV, V]
             z_out = GTensor(z_out_mem, dtype=T.bf16, shape=(-1,))
             z_if = scf.IfOp(_to_raw(is_qv), results_=[], has_else=False)
@@ -426,13 +402,10 @@ def create_gdn_decode_fused_kernel(
             o_bf = valid.select(o_val, fx.Float32(0.0)).to(fx.BFloat16)
             o_if = scf.IfOp(_to_raw(lane_k == fx.Int32(0)), results_=[], has_else=False)
             with ir.InsertionPoint(o_if.then_block):
-                if fx.const_expr(fuse_norm):
-                    fx.ptr_store(o_bf.to(fx.Float32), o_lds + gv)
-                else:
-                    out.store(b_i * stride_out_tok + hv * fx.Int32(D) + gv, o_bf)
+                out.store(b_i * stride_out_tok + hv * fx.Int32(D) + gv, o_bf)
                 scf.YieldOp([])
 
-        # ---- gated RMSNorm epilogue (optional) -----------------------------------------
+        # ---- publish the q/k conv-state write-back flag ------------------------------
         if fx.const_expr(fuse_conv):
             last = ((seen == fx.Int32(RATIO - 1)) & (tid == fx.Int32(0))) & valid
             pub_if = scf.IfOp(_to_raw(tid == fx.Int32(0)), results_=[], has_else=False)
@@ -443,34 +416,8 @@ def create_gdn_decode_fused_kernel(
                     _store_i32(ctr_addr, fx.Int32(0))
                     scf.YieldOp([])
                 scf.YieldOp([])
-            if fx.const_expr(not fuse_norm):
-                fx.gpu.barrier()
-        if fx.const_expr(fuse_norm):
             fx.gpu.barrier()
-            n_if = scf.IfOp(_to_raw(is_qv), results_=[], has_else=False)
-            with ir.InsertionPoint(n_if.then_block):
-                ov = fx.Float32(fx.ptr_load(o_lds + tid))
-                s2 = ov * ov
-                for off in (32, 16, 8, 4, 2, 1):
-                    s2 = s2 + _shfl_xor(s2, off)
-                l0 = scf.IfOp(_to_raw(lane == fx.Int32(0)), results_=[], has_else=False)
-                with ir.InsertionPoint(l0.then_block):
-                    fx.ptr_store(fx.Float32(s2), red_lds + warp)
-                    scf.YieldOp([])
-                scf.YieldOp([])
-            fx.gpu.barrier()
-            n2_if = scf.IfOp(_to_raw(is_qv), results_=[], has_else=False)
-            with ir.InsertionPoint(n2_if.then_block):
-                tot = fx.Float32(0.0)
-                for w in range_constexpr(D // _WARP):
-                    tot = tot + fx.Float32(fx.ptr_load(red_lds + fx.Int32(w)))
-                rstd = fx.math.rsqrt(tot * fx.Float32(1.0 / D) + fx.Float32(norm_eps))
-                ov = fx.Float32(fx.ptr_load(o_lds + tid))
-                y = ov * rstd * r_nw * _sigmoid(r_z)
-                out.store(b_i * stride_out_tok + hv * fx.Int32(D) + tid, y.to(fx.BFloat16))
-                scf.YieldOp([])
         if fx.const_expr(fuse_conv):
-            # flag published before the epilogue barriers
             is_last = (fx.Int32(fx.ptr_load(flag_lds)) == fx.Int32(1)) & valid
             wb_if = scf.IfOp(_to_raw(is_last), results_=[], has_else=False)
             with ir.InsertionPoint(wb_if.then_block):
@@ -492,7 +439,6 @@ def create_gdn_decode_fused_kernel(
         dt_bias_mem: fx.Tensor,
         state_mem: fx.Tensor,
         indices_mem: fx.Tensor,
-        norm_w_mem: fx.Tensor,
         out_mem: fx.Tensor,
         z_out_mem: fx.Tensor,
         stride_x_tok: fx.Int32,
@@ -517,7 +463,6 @@ def create_gdn_decode_fused_kernel(
             dt_bias_mem,
             state_mem,
             indices_mem,
-            norm_w_mem,
             out_mem,
             z_out_mem,
             stride_x_tok,
@@ -534,15 +479,12 @@ def create_gdn_decode_fused_kernel(
             stream=stream,
         )
 
-    hints = {
+    launch.compile_hints = {
         "llvm_options": {
             "amdgpu-kernarg-preload": True,
             "amdgpu-kernarg-preload-count": 16,
         }
     }
-    if waves_per_eu:
-        hints["waves_per_eu"] = waves_per_eu
-    launch.compile_hints = hints
     return launch
 
 
