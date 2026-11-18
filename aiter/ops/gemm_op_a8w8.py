@@ -687,7 +687,10 @@ def gemm_a8w8_bpreshuffle_fake(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
+    out: Tensor | None = None,
 ) -> Tensor:
+    if out is not None:
+        return out
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
@@ -700,6 +703,7 @@ def gemm_a8w8_bpreshuffle(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
+    out: Tensor | None = None,
 ) -> Tensor:
     assert dtype in [
         torch.bfloat16,
@@ -725,7 +729,18 @@ def gemm_a8w8_bpreshuffle(
     #         return res
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    # `out`: optional caller-owned [M, N] buffer (e.g. a row slice of a larger tensor); every
+    # path below writes into Y, so the result is the same as without it.
+    if out is not None:
+        assert (
+            out.shape == (m, n)
+            and out.dtype == dtype
+            and out.device == XQ.device
+            and out.is_contiguous()
+        ), f"gemm_a8w8_bpreshuffle: out {tuple(out.shape)}/{out.dtype} != ({m},{n})/{dtype}"
+        Y = out
+    else:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(

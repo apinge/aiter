@@ -971,6 +971,25 @@ def _get_compile_fn():
     return _flydsl_compile_fn
 
 
+# fp8 tiles whose C-shuffle epilogue is checked bit-identical to the default epilogue on gfx942
+# (op_tests/test_gemm_a8w8_bpreshuffle_flydsl_cshuffle.py); 4-6 % faster on MI308X.
+# Keyed by (tile_m, tile_n, tile_k, waves_per_eu).
+_CSHUFFLE_TILES_GFX942 = {(64, 256, 128, 0), (64, 256, 128, 2)}
+_cshuffle_failed = set()
+
+
+def _use_cshuffle(in_dtype, out_dtype, tile, use_async_copy, xcd_swizzle, lds_stage):
+    return (
+        in_dtype == "fp8"
+        and out_dtype == "bf16"
+        and not use_async_copy
+        and xcd_swizzle == 0
+        and lds_stage == 2
+        and tile in _CSHUFFLE_TILES_GFX942
+        and get_gfx() == "gfx942"
+    )
+
+
 def flydsl_preshuffle_gemm_a8(
     XQ: Tensor,
     WQ: Tensor,
@@ -1024,20 +1043,35 @@ def flydsl_preshuffle_gemm_a8(
             f"[FlyDSL] unsupported output dtype {Out.dtype}; expected torch.bfloat16 or torch.float16"
         )
 
-    exe = compile_fn(
-        N=n,
-        K=k,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        in_dtype=in_dtype,
-        out_dtype=out_dtype,
-        use_async_copy=bool(use_async_copy),
-        waves_per_eu=wpe,
-        enable_scheduler=bool(enable_scheduler),
-        xcd_swizzle=int(xcd_swizzle),
-        lds_stage=int(lds_stage),
-    )
+    compile_kw = {
+        "N": n,
+        "K": k,
+        "tile_m": tile_m,
+        "tile_n": tile_n,
+        "tile_k": tile_k,
+        "in_dtype": in_dtype,
+        "out_dtype": out_dtype,
+        "use_async_copy": bool(use_async_copy),
+        "waves_per_eu": wpe,
+        "enable_scheduler": bool(enable_scheduler),
+        "xcd_swizzle": int(xcd_swizzle),
+        "lds_stage": int(lds_stage),
+    }
+    tile = (tile_m, tile_n, tile_k, wpe or 0)
+    exe = None
+    if (n, k, tile) not in _cshuffle_failed and _use_cshuffle(
+        in_dtype, out_dtype, tile, use_async_copy, xcd_swizzle, lds_stage
+    ):
+        try:
+            exe = compile_fn(**compile_kw, cshuffle=True)
+        except Exception as e:  # noqa: BLE001
+            _cshuffle_failed.add((n, k, tile))
+            logger.warning(
+                f"[FlyDSL] C-shuffle epilogue failed for N={n} K={k} tile {tile}, "
+                f"using the default epilogue: {e}"
+            )
+    if exe is None:
+        exe = compile_fn(**compile_kw)
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
