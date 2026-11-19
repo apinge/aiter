@@ -621,6 +621,7 @@ def precompile_flydsl_moe(
         )
 
     if config.use_prefill:
+        gateup_block_m = config.GATEUP_BLOCK_M or config.BLOCK_M
         if _use_fused_gateup_quant(
             config, 2 * inter_dim, weight_dtype, quant_type, activation, None
         ):
@@ -634,7 +635,7 @@ def precompile_flydsl_moe(
             gateup = compile_kernel(
                 stage="gateup",
                 alg="prefill_1x4",
-                block_m=config.GATEUP_BLOCK_M or config.BLOCK_M,
+                block_m=gateup_block_m,
                 block_n=config.BLOCK_N,
                 act_quant_type_str=quant_type,
                 BLOCK_TILE_SIZE_K=config.BLOCK_K,
@@ -729,7 +730,9 @@ def precompile_flydsl_moe(
     use_batch1_algorithm = batch == 1 or config.use_batch1_algorithm
     if use_batch1_algorithm:
         # The gate-up kernel zeroes the output for down instead of a separate fill.
-        fused_down_clear = is_fp8 or (is_mxfp4 and batch > 1)
+        fused_down_clear = (is_fp8 and get_gfx() == "gfx942") or (
+            is_mxfp4 and batch > 1
+        )
         gate_layouts = (False, True) if is_mxfp4 else (False,)
         gate_block_n = 64 if is_mxfp4 and batch >= 4 else 32
         for gate_up_interleaved in gate_layouts:
@@ -835,7 +838,8 @@ def _use_fused_gateup_quant(
     config, gateup_dim, weight_dtype_str, quant_type_str, activation_str, swiglu_limit
 ):
     return (
-        weight_dtype_str == "fp8"
+        get_gfx() == "gfx942"
+        and weight_dtype_str == "fp8"
         and quant_type_str == "ptpc"
         and activation_str == "silu"
         and swiglu_limit is None
@@ -1108,7 +1112,9 @@ def _run_batch1(
     )
     force_batch1_path = problem.batch > 1
     # The gate-up kernel zeroes the output for down instead of a separate fill.
-    fused_down_clear = weight_dtype_str == "fp8" or (is_mxfp4 and force_batch1_path)
+    fused_down_clear = (weight_dtype_str == "fp8" and get_gfx() == "gfx942") or (
+        is_mxfp4 and force_batch1_path
+    )
     topk_weight = (
         topk_weight if topk_weight.dtype == torch.float32 else topk_weight.float()
     )
