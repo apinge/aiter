@@ -978,18 +978,6 @@ _CSHUFFLE_TILES_GFX942 = {(64, 256, 128, 0), (64, 256, 128, 2)}
 _cshuffle_failed = set()
 
 
-def _use_cshuffle(in_dtype, out_dtype, tile, use_async_copy, xcd_swizzle, lds_stage):
-    return (
-        in_dtype == "fp8"
-        and out_dtype == "bf16"
-        and not use_async_copy
-        and xcd_swizzle == 0
-        and lds_stage == 2
-        and tile in _CSHUFFLE_TILES_GFX942
-        and get_gfx() == "gfx942"
-    )
-
-
 def flydsl_preshuffle_gemm_a8(
     XQ: Tensor,
     WQ: Tensor,
@@ -1059,8 +1047,15 @@ def flydsl_preshuffle_gemm_a8(
     }
     tile = (tile_m, tile_n, tile_k, wpe or 0)
     exe = None
-    if (n, k, tile) not in _cshuffle_failed and _use_cshuffle(
-        in_dtype, out_dtype, tile, use_async_copy, xcd_swizzle, lds_stage
+    if (
+        get_gfx() == "gfx942"
+        and in_dtype == "fp8"
+        and out_dtype == "bf16"
+        and not use_async_copy
+        and xcd_swizzle == 0
+        and lds_stage == 2
+        and tile in _CSHUFFLE_TILES_GFX942
+        and (n, k, tile) not in _cshuffle_failed
     ):
         try:
             exe = compile_fn(**compile_kw, cshuffle=True)

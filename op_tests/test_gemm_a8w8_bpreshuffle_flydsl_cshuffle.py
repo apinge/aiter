@@ -92,20 +92,38 @@ def test_gemm_a8w8_bpreshuffle_flydsl_cshuffle(m, n, k, waves_per_eu):
 
 
 def check_dispatch_gate():
-    """Only the checked fp8 -> bf16 tiles take the C-shuffle epilogue."""
-    for wpe in (0, 2):
-        assert gemm_kernels._use_cshuffle(
-            "fp8", "bf16", (TILE_M, TILE_N, TILE_K, wpe), 0, 0, 2
-        )
-    for args in [
-        ("fp8", "bf16", (64, 256, 128, 1), 0, 0, 2),
-        ("fp8", "bf16", (128, 256, 128, 0), 0, 0, 2),
-        ("fp8", "bf16", (64, 256, 128, 0), 1, 0, 2),
-        ("fp8", "bf16", (64, 256, 128, 0), 0, 4, 2),
-        ("fp8", "bf16", (64, 256, 128, 0), 0, 0, 1),
-        ("fp8", "fp16", (64, 256, 128, 0), 0, 0, 2),
-    ]:
-        assert not gemm_kernels._use_cshuffle(*args), args
+    """On gfx942 only fp8 -> bf16 64x256x128 with waves_per_eu 0 or 2 (sync copy, lds_stage 2,
+    no xcd swizzle) asks the compiler for the C-shuffle epilogue."""
+    m, n, k = 256, 2560, 3072
+    x = torch.randn(m, k, dtype=dtypes.bf16)
+    w = torch.randn(n, k, dtype=dtypes.bf16) * 0.05
+    xq, x_scale = aiter.per_token_quant_hip(x, quant_dtype=dtypes.fp8)
+    wq, w_scale = aiter.per_token_quant_hip(w, quant_dtype=dtypes.fp8)
+    wsh = shuffle_weight(wq, (16, 16))
+    real = gemm_kernels._get_compile_fn()
+    asked = []
+    gemm_kernels._flydsl_compile_fn = lambda **kw: (
+        asked.append(kw.get("cshuffle", False)) or real(**kw)
+    )
+    try:
+        # (tile_m, tile_n, xcd_swizzle, lds_stage, waves_per_eu, out dtype, cshuffle expected)
+        for tm, tn, xcd, lds, wpe, odt, expect in [
+            (64, 256, 0, 2, 0, dtypes.bf16, True),
+            (64, 256, 0, 2, 2, dtypes.bf16, True),
+            (64, 256, 0, 2, 1, dtypes.bf16, False),
+            (128, 256, 0, 2, 0, dtypes.bf16, False),
+            (64, 256, 4, 2, 0, dtypes.bf16, False),
+            (64, 256, 0, 1, 0, dtypes.bf16, False),
+            (64, 256, 0, 2, 0, dtypes.fp16, False),
+        ]:
+            asked.clear()
+            out = torch.empty(m, n, dtype=odt)
+            gemm_kernels.flydsl_preshuffle_gemm_a8(
+                xq, wsh, x_scale, w_scale, out, tm, tn, TILE_K, 0, wpe, xcd, lds
+            )
+            assert asked[0] == expect, (tm, tn, xcd, lds, wpe, odt)
+    finally:
+        gemm_kernels._flydsl_compile_fn = real
 
 
 def main():
