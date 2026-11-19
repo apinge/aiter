@@ -10,6 +10,10 @@ fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl
     Same recurrence, but it starts from the in_proj outputs: the q/k/v/z/b/a unpack and
     the causal conv1d update (with the indexed conv-state shift) run in the same kernel.
     Writes o [B, 1, HV, V] and, if given, a contiguous z [B, HV, V] for the gated norm.
+fused_qkvzba_conv1d_gated_delta_rule_verify_flydsl
+    The chain target-verify form (T draft tokens per request): replaces sglang's
+    ``causal_conv1d_update`` + ``fused_sigmoid_gating_delta_rule_update`` with
+    intermediate conv windows and states, starting from the in_proj outputs.
 """
 
 from __future__ import annotations
@@ -17,11 +21,13 @@ from __future__ import annotations
 import torch
 
 from .kernels.gdn_decode_fused import create_gdn_decode_fused_kernel
+from .kernels.gdn_verify_fused import create_gdn_verify_fused_kernel
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
     "fused_recurrent_gated_delta_rule_packed_decode_flydsl",
     "fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl",
+    "fused_qkvzba_conv1d_gated_delta_rule_verify_flydsl",
 ]
 
 _WARP_THREADS_K = 8
@@ -142,3 +148,67 @@ def fused_qkvzba_conv1d_gated_delta_rule_decode_flydsl(
         initial_state.stride(0), HV * V, B, torch.cuda.current_stream(),
     )
     return out, initial_state
+
+
+def fused_qkvzba_conv1d_gated_delta_rule_verify_flydsl(
+    projected_qkvz: torch.Tensor,
+    projected_ba: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_weights: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    intermediate_states: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+    intermediate_conv_window: torch.Tensor,
+    num_k_heads: int,
+    num_draft_tokens: int,
+    z_out: torch.Tensor,
+) -> torch.Tensor:
+    """Chain target verify, rows ordered [request, draft token]. ``ssm_state_indices``
+    indexes the SSM and conv state pools (-1 = pad); ``intermediate_state_indices``
+    indexes the rows of ``intermediate_states`` [row, step, HV, V, K] and
+    ``intermediate_conv_window`` [row, step, conv_dim, 3]. The SSM state is read only."""
+    T = num_draft_tokens
+    assert projected_qkvz.shape[0] % T == 0
+    B = projected_qkvz.shape[0] // T
+    HV, V, K = _check_state(initial_state, scale)
+    H = num_k_heads
+    assert projected_qkvz.stride(-1) == 1 and projected_ba.stride(-1) == 1
+    assert projected_qkvz.shape[1] >= 2 * H * K + 2 * HV * V
+    assert projected_ba.shape[1] >= 2 * HV
+    assert projected_qkvz.dtype == projected_ba.dtype == out.dtype == torch.bfloat16
+    _check_params(A_log, dt_bias, H, HV)
+    assert conv_weights.is_contiguous() and conv_weights.shape[-1] == 4
+    assert conv_weights.dtype == conv_states.dtype == torch.bfloat16
+    assert conv_states.dim() == 3 and conv_states.shape[-1] == 3
+    assert intermediate_conv_window.dim() == 4 and intermediate_conv_window.shape[-1] == 3
+    assert intermediate_conv_window.dtype == torch.bfloat16
+    assert intermediate_conv_window.shape[1] >= T
+    assert intermediate_states.dtype == torch.float32
+    assert intermediate_states.dim() == 5 and intermediate_states.shape[1] >= T
+    assert intermediate_states.shape[2:] == (HV, V, K)
+    assert intermediate_states[0, 0].is_contiguous()
+    assert ssm_state_indices.dtype == intermediate_state_indices.dtype == torch.int32
+    assert ssm_state_indices.numel() >= B and intermediate_state_indices.numel() >= B
+    assert out.is_contiguous() and out.numel() == B * T * HV * V
+    assert z_out.is_contiguous() and z_out.numel() == B * T * HV * V
+    assert z_out.dtype == torch.bfloat16
+    exe = create_gdn_verify_fused_kernel(H, HV, T, K, _dt(dt_bias), _WARP_THREADS_K)
+    w = intermediate_conv_window
+    _run_compiled(
+        exe,
+        projected_qkvz, projected_ba, conv_weights, conv_states, w,
+        _arrival_counter(projected_qkvz.device, B * H), A_log, dt_bias, initial_state,
+        intermediate_states, ssm_state_indices, intermediate_state_indices, out, z_out,
+        projected_qkvz.stride(0), projected_ba.stride(0),
+        conv_states.stride(0), conv_states.stride(1), conv_states.stride(2),
+        w.stride(0), w.stride(1), w.stride(2), w.stride(3),
+        initial_state.stride(0),
+        intermediate_states.stride(0), intermediate_states.stride(1),
+        B, torch.cuda.current_stream(),
+    )
+    return out
