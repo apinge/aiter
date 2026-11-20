@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton import arch_info
+
 from ..gated_delta_rule_utils import (
     IS_NVIDIA_HOPPER,
     autotune_cache_kwargs,
@@ -836,7 +838,14 @@ def chunk_fwd_o_opt(
         for BV in BKV_LIST
         for num_warps in NUM_WARPS
         for num_stages in [2, 3, 4]
-    ],
+    ]
+    # gfx942: BKV_LIST stops at 64 (64 KB LDS), which splits V and recomputes q.k^T per
+    # V tile; a full-V single-stage tile still fits and is ~30% faster there.
+    + (
+        [triton.Config({"BK": 64, "BV": 128}, num_warps=4, num_stages=1)]
+        if arch_info.get_arch() == "gfx942"
+        else []
+    ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
