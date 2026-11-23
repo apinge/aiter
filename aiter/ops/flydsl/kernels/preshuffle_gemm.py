@@ -7,6 +7,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, math, range_constexpr, rocdl
 from flydsl.expr.typing import (
@@ -111,6 +112,17 @@ _TILE_PRELOAD_TABLE = {
 _TILE_PRELOAD_DEFAULT = (0, 0)
 
 
+def _lds_ptr3(base_i32):
+    ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Shared)
+    return fx.to_llvm_ptr(fx.inttoptr(ptr_ty, fx.Int64(base_i32)))
+
+
+def _lds_gep3(base_ptr, byte_off_i32):
+    return buffer_ops.get_element_ptr(
+        base_ptr, byte_offset=fx.Int32(byte_off_i32), elem_type=T.i8
+    )
+
+
 def _get_preload(tile_m, tile_n, tile_k):
     """Look up (dsrd_preload, dvmem_preload) from the tile table."""
     return _TILE_PRELOAD_TABLE.get(
@@ -134,10 +146,15 @@ def compile_preshuffle_gemm(
     use_async_copy: bool = False,
     xcd_swizzle: int = 0,
     lds_stage: int = 2,
+    cshuffle: bool = False,
 ):
     """Compile preshuffle GEMM (fp8/int8/fp16/bf16).
     Signature: fn(C, A, B, scale_a, scale_b, bias, M, N, stream). bias is the fused
     epilogue bias (per-N, out_dtype); unused when epilogue == "none".
+
+    cshuffle (fp8, plain MFMA, tile_m // 16 == tile_n // 64, lds_stage=2) swaps the MFMA operands
+    so each lane holds 4 consecutive output columns, then stages the C tile through the A LDS
+    buffers so stores cover whole rows. Bit-identical to the default epilogue.
     """
     if in_dtype not in ("fp8", "int8", "fp16", "bf16"):
         raise ValueError(f"in_dtype must be fp8/int8/fp16/bf16, got {in_dtype!r}")
@@ -206,6 +223,20 @@ def compile_preshuffle_gemm(
         dsrd_preload, dvmem_preload = (0, 0)
 
     a_lds_elems = tile_m * tile_k
+    # The C tile is staged through the two A LDS buffers in 2 passes of tile_n / 2.
+    use_cshuffle = cshuffle
+    if cshuffle and not (
+        is_fp8
+        and not use_mfma_scale_128
+        and m_repeat == num_acc_n
+        and not _has_epilogue
+        and lds_stage == 2
+        and tile_m * (tile_n // 2) * 2 <= 2 * a_lds_elems
+    ):
+        raise ValueError(
+            "cshuffle needs fp8 with the plain MFMA, no bias epilogue, "
+            "tile_m // 16 == tile_n // 64 and lds_stage=2"
+        )
 
     @fx.struct
     class SharedStorage:
@@ -214,7 +245,12 @@ def compile_preshuffle_gemm(
             a1: fx.Array[layout_elem, a_lds_elems, 16]
 
     # ── Kernel ────────────────────────────────────────────────────────
-    @flyc.kernel
+    # The C-shuffle variant gets its own symbol so profiles tell the two epilogues apart.
+    @flyc.kernel(
+        name=(
+            f"kernel_gemm_cshuffle_{tile_m}x{tile_n}x{tile_k}" if use_cshuffle else None
+        )
+    )
     def kernel_gemm(
         arg_c: fx.Tensor,
         arg_a: fx.Tensor,
@@ -502,13 +538,23 @@ def compile_preshuffle_gemm(
                     frag_A_retile[None, None, ki],
                 )
                 k_coord = ki if (use_mfma_scale_128 or use_mfma_k32) else (None, ki)
-                fx.gemm(
-                    tiled_mma,
-                    frag_C,
-                    frag_A[None, None, k_coord],
-                    cur_frag_B[None, None, k_coord],
-                    frag_C,
-                )
+                if const_expr(use_cshuffle):
+                    # C^T = B A^T: the accumulator holds 4 consecutive N per lane.
+                    fx.gemm(
+                        tiled_mma,
+                        frag_C,
+                        cur_frag_B[None, None, k_coord],
+                        frag_A[None, None, k_coord],
+                        frag_C,
+                    )
+                else:
+                    fx.gemm(
+                        tiled_mma,
+                        frag_C,
+                        frag_A[None, None, k_coord],
+                        cur_frag_B[None, None, k_coord],
+                        frag_C,
+                    )
 
         def pipeline_2stage(read_stage, next_k_val=None, read_next=True):
             write_stage = read_stage ^ 1
@@ -674,11 +720,46 @@ def compile_preshuffle_gemm(
             return s_a, s_b, bias
 
         overlap_epi_load = (
-            acc_size <= 64
+            acc_size <= 64 and not use_cshuffle
         )  # small enough accumulator to keep operands live over the MMA
         s_a_vals = s_b_vals = bias_vals = None
         if const_expr(overlap_epi_load):
             s_a_vals, s_b_vals, bias_vals = load_epi_operands()
+        swap_scales = None
+        if const_expr(use_cshuffle):
+            # Issued before the last MMA stage so the scale loads overlap it.
+            scale_b_rsrc_sw = buffer_ops.create_buffer_resource(
+                arg_scale_b, max_size=True
+            )
+            scale_a_rsrc_sw = buffer_ops.create_buffer_resource(
+                arg_scale_a,
+                max_size=False,
+                num_records_bytes=fx.Int64(i32_m) * fx.Int64(4),
+            )
+            swap_scales = (
+                [
+                    Vec(
+                        buffer_ops.buffer_load(
+                            scale_b_rsrc_sw,
+                            fx.Int32(
+                                by_n + (nb * num_waves + wave_id) * 16 + lane_div_16 * 4
+                            ),
+                            vec_width=4,
+                            dtype=T.f32,
+                        )
+                    ).bitcast(fx.Float32)
+                    for nb in range_constexpr(num_acc_n)
+                ],
+                [
+                    buffer_ops.buffer_load(
+                        scale_a_rsrc_sw,
+                        fx.Int32(bx_m + mb * 16 + lane_mod_16),
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                    for mb in range_constexpr(m_repeat)
+                ],
+            )
 
         # Final MMA stage — overlaps the epilogue-operand loads when issued above.
         if const_expr(lds_stage == 1):
@@ -687,7 +768,64 @@ def compile_preshuffle_gemm(
             pipeline_2stage(read_stage=(num_tiles - 1) % 2, read_next=False)
 
         # ── Epilogue ─────────────────────────────────────────────
-        if const_expr(not is_8bit and not _has_epilogue):
+        if const_expr(use_cshuffle):
+            # Slot p holds C^T block (n-block (p // 4) % m_repeat, m-block p // (m_repeat * 4));
+            # its 4 values are consecutive columns of one C row.
+            s_b4, s_a1 = swap_scales
+            c_rsrc = buffer_ops.create_buffer_resource(
+                arg_c,
+                max_size=False,
+                num_records_bytes=fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2),
+            )
+            acc_vec = Vec(frag_C.load())
+
+            def bf16x4(mb, nb):
+                vals = []
+                for ii in range_constexpr(4):
+                    p = mb * (m_repeat * 4) + nb * 4 + ii
+                    val_s = (acc_vec[p] * fx.Float32(s_a1[mb])) * s_b4[nb][ii]
+                    vals.append(val_s.to(out_elem_cls))
+                return vector.from_elements(T.vec(4, out_elem_cls.ir_type), vals)
+
+            # Staging row = tile_n / 2 bf16 in 16-byte chunks, XOR-swizzled by row % 16.
+            half_n = tile_n // 2
+            row_bytes_s = half_n * 2
+            chunks = row_bytes_s // 16
+            # a0 and a1 are adjacent struct fields: one contiguous 2 * a_lds_elems bytes.
+            lds_p = _lds_ptr3(fx.Int32(fx.ptrtoint(lds.a0.ptr)))
+            tx = fx.Int32(gpu.thread_id("x"))
+            rows_per_rd = total_threads // chunks
+            gpu.barrier()  # every wave is done reading A from LDS
+            for half in range_constexpr(2):
+                for mb in range_constexpr(m_repeat):
+                    r_loc = fx.Int32(mb * 16) + lane_mod_16
+                    for nb in range_constexpr(num_acc_n // 2):
+                        nb_g = half * (num_acc_n // 2) + nb
+                        cb = nb * num_waves + wave_id  # 16-column block in this half
+                        byte_in_row = cb * 32 + lane_div_16 * 8
+                        chunk = byte_in_row // 16
+                        phys = (
+                            r_loc * row_bytes_s
+                            + ((chunk ^ (r_loc % 16)) * 16)
+                            + byte_in_row % 16
+                        )
+                        llvm.StoreOp(
+                            bf16x4(mb, nb_g).ir_value(), _lds_gep3(lds_p, phys)
+                        )
+                gpu.barrier()
+                for j in range_constexpr(tile_m // rows_per_rd):
+                    r_loc = fx.Int32(j * rows_per_rd) + tx // chunks
+                    chunk = tx % chunks
+                    phys = r_loc * row_bytes_s + ((chunk ^ (r_loc % 16)) * 16)
+                    v8 = llvm.load(
+                        T.vec(8, out_elem_cls.ir_type), _lds_gep3(lds_p, phys)
+                    )
+                    row = bx_m + r_loc
+                    col = by_n + half * half_n + chunk * 8
+                    buffer_ops.buffer_store(v8, c_rsrc, fx.Int32(row * N + col))
+                if const_expr(half == 0):
+                    gpu.barrier()
+        elif const_expr(not is_8bit and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
         else:
