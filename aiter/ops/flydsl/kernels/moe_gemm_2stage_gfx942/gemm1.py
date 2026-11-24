@@ -43,8 +43,13 @@ def _build_moe_gemm1(
     METADATA_TILE_SIZE_M=None,
     mxfp4_gate_up_interleaved=True,
     fused_down_clear=False,
+    FUSE_QUANT=False,
+    WAVES_PER_EU=0,
 ):
     assert stage == "gateup"
+    if FUSE_QUANT:
+        assert alg == "prefill_1x4" and weight_dtype == "fp8" and BLOCK_TILE_SIZE_N == N
+        assert BLOCK_TILE_SIZE_M % 64 == 0 and (N // 2) % 32 == 0
     is_gfx950 = "gfx950" in str(get_rocm_arch())
     TILE_K = 64
     # Optional TILE_K override for the prefill_1x4 alg. The env fallback lets test_moe.py /
@@ -147,9 +152,13 @@ def _build_moe_gemm1(
         # all waves (no M-split). B (weight gate/up)
         # loads direct global->register (no LDS); only A (activation) is staged through LDS
         # with a ping-pong double buffer (a_ping / a_pong).
-        assert 128 <= BLOCK_TILE_SIZE_N <= 256 and BLOCK_TILE_SIZE_N % 128 == 0, (
-            "For prefill_1x4 alg, BLOCK_TILE_SIZE_N must be in [128, 256] and a multiple of 128 "
-            "(each wave owns contiguous_n//4 = BN//8 output channels, a multiple of 16)"
+        # Full-row tiles (BN == N) let one CTA see every channel of a route, which the
+        # fused per-row fp8 quant of the activated output needs.
+        assert (128 <= BLOCK_TILE_SIZE_N <= 256 and BLOCK_TILE_SIZE_N % 128 == 0) or (
+            BLOCK_TILE_SIZE_N == N and N % 128 == 0
+        ), (
+            "For prefill_1x4 alg, BLOCK_TILE_SIZE_N must be in [128, 256] and a multiple of 128, "
+            "or the full N (each wave owns contiguous_n//4 output channels, a multiple of 16)"
         )
         assert N % BLOCK_TILE_SIZE_N == 0, (
             f"gateup prefill_1x4 requires a complete N tile, got N={N}, "
@@ -202,10 +211,16 @@ def _build_moe_gemm1(
         )  # full A tile; ping-pong needs two buffers
         lds_elem = fx.Float8E4M3FNUZ if weight_dtype == "fp8" else fx.BFloat16
 
+        _a_bytes = 2 * a_lds_size * (1 if weight_dtype == "fp8" else 2)
+        _cshuffle_need = BLOCK_TILE_SIZE_M * (BLOCK_TILE_SIZE_N // 2) * 2
+        _pad_bytes = max(0, _cshuffle_need - _a_bytes)
+
         @fx.struct
         class GemmBuffers:
             a_ping: fx.Array[lds_elem, a_lds_size, 16]
             a_pong: fx.Array[lds_elem, a_lds_size, 16]
+            if _pad_bytes:
+                cshuffle_pad: fx.Array[fx.Int8, _pad_bytes, 16]
 
         @fx.union
         class SharedStorage:
@@ -215,7 +230,7 @@ def _build_moe_gemm1(
         # The CShuffle epilogue stages the single (BM x contiguous_n) bf16 output into the
         # A LDS (reused after the main loop). Confirm it fits.
         _cshuffle_elem_bytes = 1 if weight_dtype == "fp8" else 2
-        _gemm_lds_bytes = 2 * a_lds_size * _cshuffle_elem_bytes
+        _gemm_lds_bytes = 2 * a_lds_size * _cshuffle_elem_bytes + _pad_bytes
         _cshuffle_bytes = BLOCK_TILE_SIZE_M * (BLOCK_TILE_SIZE_N // 2) * 2
         assert _cshuffle_bytes <= _gemm_lds_bytes, (
             f"CShuffle needs {_cshuffle_bytes} B of LDS but GemmBuffers only allocates "
@@ -2143,6 +2158,94 @@ def _build_moe_gemm1(
                         clear_output,
                     )
 
+    def _quant_rows_epilogue(lds_c, sorted_ids_buf, tid, M, i64_q_out, i64_q_scale):
+        """Per-route fp8 quant of the staged bf16 [BM, N/2] tile: 4 adjacent lanes own a row
+        (8 channels per 32-channel slice each); amax, scale = amax / 240, x * rcp(scale).
+        """
+        from aiter.ops.flydsl.kernels import buffer_ops
+
+        inter = N // 2
+        n_slices = inter // 32
+        m_passes = BLOCK_TILE_SIZE_M // 64
+        rd_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+        rd_copy = fx.make_tiled_copy(
+            rd_atom,
+            fx.make_layout(((4, 64), 8), ((512, 1), 64)),
+            fx.make_tile(64, 32),
+        )
+        src = rd_copy.get_slice(tid).partition_S(lds_c)
+        frag = fx.make_fragment_like(src)
+        fx.copy(rd_atom, src, frag)
+
+        q_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            i64_q_out, num_records_bytes=fx.Int64(M) * fx.Int64(TOPK * inter)
+        )
+        s_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            i64_q_scale, num_records_bytes=fx.Int64(M) * fx.Int64(TOPK * 4)
+        )
+        quarter = tid % 4
+        row_in_pass = tid // 4
+        f32 = T.f32
+        inv_fp8_max = fx.Float32(float(1.0 / 240.0))
+        clamp_hi = fx.Float32(240.0)
+        clamp_lo = fx.Float32(-240.0)
+        fm_fast = fx.arith.FastMathFlags.fast
+        for mp in range_constexpr(m_passes):
+            vals = []
+            amax = fx.Float32(0.0)
+            for sl in range_constexpr(n_slices):
+                v8 = frag[None, mp, sl].load()
+                f8 = [v8[j].to(fx.Float32) for j in range_constexpr(8)]
+                for j in range_constexpr(8):
+                    amax = amax.maximumf(
+                        fx.Float32(
+                            llvm.call_intrinsic(
+                                f32, "llvm.fabs.f32", [_raw(f8[j])], [], []
+                            )
+                        )
+                    )
+                vals.append(f8)
+            for dist in (1, 2):
+                peer = amax.shuffle_xor(fx.Int32(dist), fx.Int32(64))
+                amax = amax.maximumf(peer)
+            scale = amax * inv_fp8_max
+            inv_scale = fx.Float32(rocdl.rcp(T.f32, _raw(scale)))
+
+            sid = fx.Int32(sorted_ids_buf[row_in_pass + mp * 64])
+            token = sid & fx.Int32(0xFFFFFF)
+            slot = sid >> fx.Int32(24)
+            route = token * fx.Int32(TOPK) + slot
+            buffer_ops.buffer_store(
+                _raw(scale),
+                s_rsrc,
+                route * fx.Int32(4),
+                mask=_raw(quarter == fx.Int32(0)),
+                offset_is_bytes=True,
+            )
+            for sl in range_constexpr(n_slices):
+                f8 = vals[sl]
+                q = [
+                    fx.math.clampf(
+                        f8[j] * inv_scale, clamp_lo, clamp_hi, fastmath=fm_fast
+                    )
+                    for j in range_constexpr(8)
+                ]
+                words = []
+                for w in range_constexpr(2):
+                    lo = rocdl.cvt_pk_fp8_f32(
+                        T.i32, _raw(q[4 * w]), _raw(q[4 * w + 1]), fx.Int32(0), False
+                    )
+                    words.append(
+                        rocdl.cvt_pk_fp8_f32(
+                            T.i32, _raw(q[4 * w + 2]), _raw(q[4 * w + 3]), lo, True
+                        )
+                    )
+                packed = vector.from_elements(T.vec(2, T.i32), words)
+                off = (
+                    route * fx.Int32(inter) + fx.Int32(sl * 32) + quarter * fx.Int32(8)
+                )
+                buffer_ops.buffer_store(packed, q_rsrc, off, offset_is_bytes=True)
+
     @flyc.kernel
     def moe_2stage_gateup_prefill_1x4(
         p_input: fx.Pointer,  # bf16 or native-fp8 [M, K]
@@ -2160,6 +2263,8 @@ def _build_moe_gemm1(
         situ_linear_beta_f: fx.Float32,
         situ_linear_beta_rcp_f: fx.Float32,
         activation_limit_f: fx.Float32,
+        i64_q_out: fx.Int64,
+        i64_q_scale: fx.Int64,
     ):
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
@@ -2343,9 +2448,14 @@ def _build_moe_gemm1(
                 store_c.partition_D(lds_c_store),
             )
             gpu.barrier()
-            rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
-            fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
-            c_out.copy(buf_atom_w128, blk_n, rd)
+            if const_expr(FUSE_QUANT):
+                _quant_rows_epilogue(
+                    lds_c, sorted_ids_buf, tid, M, i64_q_out, i64_q_scale
+                )
+            else:
+                rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
+                fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
+                c_out.copy(buf_atom_w128, blk_n, rd)
 
     @flyc.jit
     def launch_splitk(
@@ -2437,6 +2547,8 @@ def _build_moe_gemm1(
         situ_linear_beta_f: fx.Float32,
         situ_linear_beta_rcp_f: fx.Float32,
         activation_limit_f: fx.Float32,
+        i64_q_out: fx.Int64,
+        i64_q_scale: fx.Int64,
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
@@ -2460,6 +2572,9 @@ def _build_moe_gemm1(
             situ_linear_beta_f,
             situ_linear_beta_rcp_f,
             activation_limit_f,
+            i64_q_out,
+            i64_q_scale,
+            value_attrs={"rocdl.waves_per_eu": (WAVES_PER_EU or None)},
         ).launch(grid=(num_n_blocks, task_num, 1), block=(256, 1, 1), stream=stream)
 
     if const_expr(alg == "prefill_1x4"):
@@ -2491,6 +2606,8 @@ def _compile_moe_gemm1_cached(
     mxfp4_gate_up_interleaved=True,
     fused_down_clear=False,
     METADATA_TILE_SIZE_M=None,
+    FUSE_QUANT=False,
+    WAVES_PER_EU=0,
 ):
     del device_cache_key
     return _build_moe_gemm1(
@@ -2515,6 +2632,8 @@ def _compile_moe_gemm1_cached(
         METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
         mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
         fused_down_clear=fused_down_clear,
+        FUSE_QUANT=FUSE_QUANT,
+        WAVES_PER_EU=WAVES_PER_EU,
     )
 
 
@@ -2538,8 +2657,14 @@ def compile_moe_gemm1(
     mxfp4_gate_up_interleaved=True,
     fused_down_clear=False,
     METADATA_TILE_SIZE_M=None,
+    FUSE_QUANT=False,
+    WAVES_PER_EU=0,
 ):
-    """Build and cache a stage1 gate-up launcher for one static configuration."""
+    """Build and cache a stage1 gate-up launcher for one static configuration.
+
+    FUSE_QUANT (full-row fp8 prefill_1x4 only): instead of the bf16 [M, TOPK, N/2] output,
+    write its per-route fp8 quant ([M * TOPK, N/2] fp8 at i64_q_out, [M * TOPK] f32 scales
+    at i64_q_scale) with the same formula as aiter's dynamic per-token quant."""
     return _compile_moe_gemm1_cached(
         get_device_cache_key(),
         N=N,
@@ -2560,6 +2685,8 @@ def compile_moe_gemm1(
         mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
         fused_down_clear=fused_down_clear,
         METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
+        FUSE_QUANT=FUSE_QUANT,
+        WAVES_PER_EU=WAVES_PER_EU,
     )
 
 

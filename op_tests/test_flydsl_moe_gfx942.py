@@ -33,6 +33,7 @@ from aiter.fused_moe_registry import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.flydsl import fused_moe_gfx942
 from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
 from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
     gemm2_8x1_compact as compact,
@@ -440,6 +441,18 @@ def check_moe(
     else:
         output = impl(request)
     err = check_output(reference, output, config)
+    if parsed.use_prefill and fused_moe_gfx942._use_fused_gateup_quant(
+        parsed,
+        2 * inter_dim,
+        "fp8" if quant != "no" else "bf16",
+        quant,
+        activation,
+        None,
+    ):
+        # The gate-up kernel's fused per-route quant replaces the per-token quant pass.
+        with patch.object(fused_moe_gfx942, "_FUSED_QUANT_MAX_N", 0):
+            unfused = impl(request)
+        assert torch.equal(output, unfused), f"{config}: fused quant is not bit-exact"
     # Decode kernels accumulate routes with atomics, so only prefill paths are compared.
     if parsed.use_prefill:
         first = first_output.setdefault("output", output.clone())
