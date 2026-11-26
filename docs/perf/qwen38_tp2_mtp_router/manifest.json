@@ -1,0 +1,86 @@
+{
+  "date_utc": "2026-11-26",
+  "baseline_commit": "1cf62092f39fac89d9cdf54e2dc8978cbb4591f2",
+  "hardware": {
+    "name": "AMD Instinct MI308X",
+    "gfx": "gfx942",
+    "cu_num": 80,
+    "physical_gpus": [
+      2,
+      3
+    ]
+  },
+  "software": {
+    "torch": "2.12.0+rocm7.14.0.git6bbd260",
+    "hip": "7.14.60850",
+    "hipblaslt_library": "libhipblaslt.so.1.4",
+    "hipblaslt_sha256": "39e8f4d3db3d690f964e8971b421fae8cd64a9e6398a6ea688354be8bd8fc122"
+  },
+  "model": {
+    "router_layers": 48,
+    "weight_dtype": "BF16",
+    "weight_shape": [
+      512,
+      2560
+    ],
+    "activations": "generated BF16 normal, seed=20261125+M"
+  },
+  "method": {
+    "graphs": "48 distinct checkpoint router weights per graph",
+    "rounds": 3,
+    "pair_order": [
+      "BCCB",
+      "CBBC",
+      "BCCB"
+    ],
+    "samples_per_backend_per_gpu": 6,
+    "replays_per_sample": 100,
+    "units": "microseconds per complete tgemm.mm call",
+    "comparison_statistic": "mean of the two GPU medians for a matched baseline/candidate pair",
+    "rtol": 0.02,
+    "atol": 0.02,
+    "all_240_candidate_gpu_shape_checks_passed": true,
+    "published_paired_samples": "192 samples for the eight accepted changes; all 240 candidate summaries are in candidate_comparison.csv"
+  },
+  "scope": {
+    "tp": 2,
+    "speculative_steps": 3,
+    "topk": 1,
+    "draft_tokens": 4,
+    "max_running_requests": 32,
+    "M": [
+      4,
+      8,
+      12,
+      16,
+      20,
+      24,
+      28,
+      32,
+      40,
+      48,
+      56,
+      64,
+      72,
+      80,
+      88,
+      96,
+      104,
+      112,
+      120,
+      128
+    ]
+  },
+  "limits": [
+    "No full serving TPOT measurement.",
+    "The 48-router graph does not include attention, MoE or communication gaps.",
+    "BF16 outputs are tolerance-equivalent, not guaranteed bit-identical."
+  ],
+  "validation": {
+    "config_shape_collision_tests": "14 passed",
+    "default_dispatch_audit": "M1..256 changes only 72,80,88,96,104,112,120,128",
+    "reproduction_cli": "M72 and M128 checked on GPU2 after normal CSV load",
+    "black": "26.10.1",
+    "ruff": "0.16.0"
+  }
+}
