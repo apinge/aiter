@@ -17,8 +17,6 @@ import aiter
 from aiter import tuned_gemm as tg
 from aiter.jit.core import AITER_CONFIGS
 
-ROOT = Path(__file__).resolve().parents[1]
-RESULTS = ROOT / "docs/perf/qwen38_tp2_mtp_router"
 VERIFY_M = [
     4,
     8,
@@ -138,10 +136,16 @@ def main():
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--router-prefix", default="model.language_model.layers.")
     parser.add_argument(
-        "--baseline-csv", type=Path, default=RESULTS / "baseline_router.csv"
+        "--baseline-csv",
+        type=Path,
+        required=True,
+        help="Baseline BF16 tuning CSV path or colon-separated CSV paths",
     )
     parser.add_argument(
-        "--candidate-csv", type=Path, default=RESULTS / "selected_router.csv"
+        "--candidate-csv",
+        type=Path,
+        required=True,
+        help="Candidate BF16 tuning CSV path or colon-separated CSV paths",
     )
     parser.add_argument("--m", type=int, nargs="+", default=VERIFY_M)
     parser.add_argument(
