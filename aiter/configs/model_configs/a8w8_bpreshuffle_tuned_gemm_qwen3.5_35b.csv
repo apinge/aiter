@@ -1,0 +1,17 @@
+gfx,cu_num,M,N,K,q_dtype_w,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx942,80,1,4608,2048,torch.float8_e4m3fnuz,flydsl,505,0,5.5017,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x2x0x2_default,3.43,1717.37,0.0
+gfx942,80,2,4608,2048,torch.float8_e4m3fnuz,flydsl,1,0,5.6077,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x0x0x2_default,6.73,1686.90,0.0
+gfx942,80,4,4608,2048,torch.float8_e4m3fnuz,flydsl,505,0,5.5329,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x2x0x2_default,13.65,1713.78,0.0
+gfx942,80,8,4608,2048,torch.float8_e4m3fnuz,flydsl,505,0,5.5752,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x2x0x2_default,27.08,1708.86,0.0
+gfx942,80,16,4608,2048,torch.float8_e4m3fnuz,flydsl,505,0,5.6840,flydsl_bpreshuflle_16x64x512_F8_F8_B16_0x2x0x2_default,53.13,1692.02,0.0
+gfx942,80,32,4608,2048,torch.float8_e4m3fnuz,flydsl,10,0,6.6646,flydsl_bpreshuflle_32x64x512_F8_F8_B16_0x0x0x2_default,90.62,1470.10,0.0
+gfx942,80,64,4608,2048,torch.float8_e4m3fnuz,flydsl,10,0,8.1808,flydsl_bpreshuflle_32x64x512_F8_F8_B16_0x0x0x2_default,147.66,1241.70,0.0
+gfx942,80,128,4608,2048,torch.float8_e4m3fnuz,flydsl,528,0,13.1063,flydsl_bpreshuflle_64x128x256_F8_F8_B16_0x2x0x2_default,184.33,830.06,0.0
+gfx942,80,256,4608,2048,torch.float8_e4m3fnuz,flydsl,24,0,20.2361,flydsl_bpreshuflle_64x128x256_F8_F8_B16_0x0x0x2_default,238.77,608.85,0.0
+gfx942,80,512,4608,2048,torch.float8_e4m3fnuz,flydsl,531,0,26.9176,flydsl_bpreshuflle_64x256x128_F8_F8_B16_0x2x0x2_default,359.01,564.85,0.0
+gfx942,80,1024,4608,2048,torch.float8_e4m3fnuz,flydsl,531,0,47.9939,flydsl_bpreshuflle_64x256x128_F8_F8_B16_0x2x0x2_default,402.70,436.96,0.0
+gfx942,80,2048,4608,2048,torch.float8_e4m3fnuz,flydsl,531,0,89.6678,flydsl_bpreshuflle_64x256x128_F8_F8_B16_0x2x0x2_default,431.09,362.51,0.0
+gfx942,80,4096,4608,2048,torch.float8_e4m3fnuz,flydsl,531,0,169.3955,flydsl_bpreshuflle_64x256x128_F8_F8_B16_0x2x0x2_default,456.38,328.08,0.0
+gfx942,80,8192,4608,2048,torch.float8_e4m3fnuz,flydsl,27,0,322.5660,flydsl_bpreshuflle_64x256x128_F8_F8_B16_0x0x0x2_default,479.34,315.32,0.0
+gfx942,80,16384,4608,2048,torch.float8_e4m3fnuz,flydsl,531,0,640.6320,flydsl_bpreshuflle_64x256x128_F8_F8_B16_0x2x0x2_default,482.71,302.80,0.0
+gfx942,80,32768,4608,2048,torch.float8_e4m3fnuz,flydsl,531,0,1363.0003,flydsl_bpreshuflle_64x256x128_F8_F8_B16_0x2x0x2_default,453.76,277.72,0.0
